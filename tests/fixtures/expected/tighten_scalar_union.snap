@@ -1,0 +1,66 @@
+{
+  "mcp_name": "probe",
+  "cap_name": "probe",
+  "description": "Tool probe",
+  "fields": [
+    {
+      "mcp_name": "count",
+      "rust_name": "count",
+      "type": {
+        "Enum": {
+          "type_name": "ProbeCountValue",
+          "variants": [
+            {
+              "name": "Integer",
+              "kind": {
+                "Scalar": "Integer"
+              }
+            },
+            {
+              "name": "Number",
+              "kind": {
+                "Scalar": "Number"
+              }
+            }
+          ]
+        }
+      },
+      "required": false,
+      "description": ""
+    },
+    {
+      "mcp_name": "repo",
+      "rust_name": "repo",
+      "type": {
+        "Enum": {
+          "type_name": "ProbeRepoValue",
+          "variants": [
+            {
+              "name": "Single",
+              "kind": {
+                "Scalar": "String"
+              }
+            },
+            {
+              "name": "TextList",
+              "kind": {
+                "Scalar": {
+                  "Array": {
+                    "item": "String"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": true,
+      "description": ""
+    }
+  ],
+  "top_level_map": false,
+  "effect": "ExternalWrite",
+  "risk": "Medium",
+  "flags": [],
+  "warnings": []
+}

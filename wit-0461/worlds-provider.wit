@@ -1,0 +1,27 @@
+package dekopon:provider@0.4.0;
+
+/// A provider is a Unix process per invocation: JSON input, standard streams and an exit status.
+world provider {
+    import dekopon:stdio/streams@0.1.0;
+
+    /// Returns a JSON-encoded provider manifest.
+    export describe: func() -> string;
+
+    /// Runs one declared capability. `ok` is exit status 0 and `err(n)` is exit status `n`; the
+    /// output goes to stdout and the reason for a failure to stderr. A host reports `err(0)` as
+    /// status 1.
+    export invoke: func(capability: string, input-json: string) -> result<_, u8>;
+}
+
+/// A provider whose command words behave like a command-line program.
+world provider-cli {
+    include provider;
+
+    /// Runs one command word's argv and returns JSON: a capability proposal, rendered text with
+    /// an exit status (help, version, usage errors), or a decline.
+    ///
+    /// `stdin-piped` says whether the invocation will have a stdin; the bytes are not read here.
+    /// Pure and import-free: a proposal is authorized as any other, and rendered text is produced
+    /// by the guest alone.
+    export run-command: func(argv: list<string>, stdin-piped: bool) -> string;
+}

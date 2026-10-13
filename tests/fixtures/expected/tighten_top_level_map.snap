@@ -1,0 +1,21 @@
+{
+  "mcp_name": "probe",
+  "cap_name": "probe",
+  "description": "Tool probe",
+  "fields": [
+    {
+      "mcp_name": "payload",
+      "rust_name": "payload",
+      "type": "JsonString",
+      "required": true,
+      "description": "The arguments object as JSON text."
+    }
+  ],
+  "top_level_map": true,
+  "effect": "ExternalWrite",
+  "risk": "Medium",
+  "flags": [
+    "free-map-as-string"
+  ],
+  "warnings": []
+}

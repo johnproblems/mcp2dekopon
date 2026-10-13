@@ -1,0 +1,58 @@
+{
+  "mcp_name": "probe",
+  "cap_name": "probe",
+  "description": "Tool probe",
+  "fields": [
+    {
+      "mcp_name": "filter",
+      "rust_name": "filter",
+      "type": {
+        "Object": {
+          "type_name": "ProbeFilter",
+          "fields": [
+            {
+              "mcp_name": "limit",
+              "rust_name": "limit",
+              "type": "Integer",
+              "required": false,
+              "description": ""
+            },
+            {
+              "mcp_name": "tags",
+              "rust_name": "tags",
+              "type": {
+                "Array": {
+                  "item": "String"
+                }
+              },
+              "required": true,
+              "description": ""
+            }
+          ]
+        }
+      },
+      "required": true,
+      "description": ""
+    },
+    {
+      "mcp_name": "matrix",
+      "rust_name": "matrix",
+      "type": {
+        "Array": {
+          "item": {
+            "Array": {
+              "item": "Number"
+            }
+          }
+        }
+      },
+      "required": false,
+      "description": ""
+    }
+  ],
+  "top_level_map": false,
+  "effect": "ExternalWrite",
+  "risk": "Medium",
+  "flags": [],
+  "warnings": []
+}

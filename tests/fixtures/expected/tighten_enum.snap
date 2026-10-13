@@ -1,0 +1,59 @@
+{
+  "mcp_name": "probe",
+  "cap_name": "probe",
+  "description": "Tool probe",
+  "fields": [
+    {
+      "mcp_name": "target",
+      "rust_name": "target",
+      "type": {
+        "Enum": {
+          "type_name": "ProbeTargetValue",
+          "variants": [
+            {
+              "name": "Repo",
+              "kind": {
+                "Struct": {
+                  "type_name": "ProbeTargetBranch0",
+                  "fields": [
+                    {
+                      "mcp_name": "repo",
+                      "rust_name": "repo",
+                      "type": "String",
+                      "required": true,
+                      "description": ""
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "name": "Gist",
+              "kind": {
+                "Struct": {
+                  "type_name": "ProbeTargetBranch1",
+                  "fields": [
+                    {
+                      "mcp_name": "gist",
+                      "rust_name": "gist",
+                      "type": "String",
+                      "required": false,
+                      "description": ""
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": true,
+      "description": ""
+    }
+  ],
+  "top_level_map": false,
+  "effect": "ExternalWrite",
+  "risk": "Medium",
+  "flags": [],
+  "warnings": []
+}
