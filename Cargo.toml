@@ -6,7 +6,7 @@ description = "Generate Dekopon providers from MCP servers"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/johnproblems/mcp2dekopon"
 readme = "README.md"
-keywords = ["mcp", "model-context-protocol", "dekopon", "codegen"]
+keywords = ["mcp", "mcp-server", "dekopon", "codegen"]
 categories = ["command-line-utilities"]
 # The crate embeds wit-0461/ via include_str!, and the test suite reads
 # scripts/, .github/, README.md, PRD.md, and docs/; all must ship.
