@@ -22,6 +22,7 @@ SEARCH = {
         "properties": {
             "query": {"type": "string", "description": "The question."},
             "limit": {"type": "integer"},
+            "sort": {"type": "string", "enum": ["asc", "desc"]},
         },
         "required": ["query"],
     },
@@ -225,19 +226,46 @@ def make_extra(index):
     }
 
 
+USAGE = "Usage: mock-mcp.py [PORT] [--extra N] [--require-auth TOKEN]"
+
+
+def fail(message):
+    print(f"mock-mcp.py: {message}\n{USAGE}", file=sys.stderr)
+    raise SystemExit(2)
+
+
 def main():
     global EXTRA_TOOLS, REQUIRE_AUTH
     args = sys.argv[1:]
     port = 0
     extra = 0
+    port_set = False
     while args:
         arg = args.pop(0)
-        if arg == "--extra" and args:
-            extra = int(args.pop(0))
-        elif arg == "--require-auth" and args:
+        if arg in ("--help", "-h"):
+            print(USAGE)
+            return
+        elif arg == "--extra":
+            if not args:
+                fail("expected a number after --extra")
+            try:
+                extra = int(args.pop(0))
+            except ValueError:
+                fail("expected a number after --extra")
+        elif arg == "--require-auth":
+            if not args:
+                fail("expected a token after --require-auth")
             REQUIRE_AUTH = args.pop(0)
+        elif arg.startswith("-"):
+            fail(f"unknown option {arg}")
+        elif port_set:
+            fail(f"unexpected argument {arg}")
         else:
-            port = int(arg)
+            try:
+                port = int(arg)
+            except ValueError:
+                fail(f"expected a port number, got {arg!r}")
+            port_set = True
     EXTRA_TOOLS = [make_extra(i) for i in range(extra)]
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(server.server_address[1], flush=True)

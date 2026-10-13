@@ -16,14 +16,64 @@ pub struct McpTool {
     pub input_schema: Value,
     pub read_only: Option<bool>,
     pub destructive: Option<bool>,
+    /// The raw listed object, kept so `--save-tools` round-trips faithfully.
+    pub raw: Value,
 }
 
 /// Who the server claims to be.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ServerInfo {
     pub name: String,
     pub version: String,
     pub protocol_version: String,
+}
+
+/// A tool list saved with `--save-tools` and replayed with `--from-file`.
+/// Tools stay raw MCP tool objects so loading reuses the fetch parser.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedTools {
+    pub format_version: u32,
+    pub server: ServerInfo,
+    pub tools: Vec<Value>,
+}
+
+impl SavedTools {
+    pub fn save(
+        path: &std::path::Path,
+        server: &ServerInfo,
+        tools: &[McpTool],
+    ) -> Result<(), String> {
+        let saved = Self {
+            format_version: 1,
+            server: server.clone(),
+            tools: tools.iter().map(|tool| tool.raw.clone()).collect(),
+        };
+        let text = serde_json::to_string_pretty(&saved)
+            .map_err(|e| format!("cannot encode tool list: {e}"))?;
+        std::fs::write(path, format!("{text}\n"))
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))
+    }
+
+    pub fn load(path: &std::path::Path) -> Result<(ServerInfo, Vec<McpTool>), String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let saved: Self = serde_json::from_str(&text)
+            .map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
+        if saved.format_version != 1 {
+            return Err(format!(
+                "unsupported tool list version {} in {}",
+                saved.format_version,
+                path.display()
+            ));
+        }
+        let mut tools = Vec::with_capacity(saved.tools.len());
+        for raw in &saved.tools {
+            tools.push(parse_tool(raw).map_err(|e| e.to_string())?);
+        }
+        Ok((saved.server, tools))
+    }
 }
 
 /// Why a fetch failed. Carries status codes and server messages, never secrets.
@@ -31,6 +81,7 @@ pub struct ServerInfo {
 pub enum FetchError {
     Transport(String),
     Status(u16),
+    Unauthorized(u16),
     Body(String),
     Rpc(RpcError),
 }
@@ -40,6 +91,10 @@ impl std::fmt::Display for FetchError {
         match self {
             Self::Transport(message) => write!(formatter, "request failed: {message}"),
             Self::Status(status) => write!(formatter, "server returned status {status}"),
+            Self::Unauthorized(status) => write!(
+                formatter,
+                "server returned status {status}; if the server needs auth, pass --header \"Authorization: ...\""
+            ),
             Self::Body(message) => write!(formatter, "bad response: {message}"),
             Self::Rpc(error) => write!(formatter, "{error}"),
         }
@@ -47,6 +102,10 @@ impl std::fmt::Display for FetchError {
 }
 
 impl std::error::Error for FetchError {}
+
+const MAX_PAGES: usize = 100;
+const MAX_TOOLS: usize = 1000;
+const MAX_ATTEMPTS: u32 = 3;
 
 /// Validated `--url`: the vendor base, its origin and the broker scope entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,7 +175,10 @@ pub fn validate_endpoint(raw: &str) -> Result<Endpoint, String> {
     })
 }
 
-/// Fetches every tool the server lists.
+/// Fetches every tool the server lists: `initialize`, the
+/// `notifications/initialized` notice (best effort), then `tools/list`
+/// following `nextCursor`. Transient failures are retried; an expired session
+/// (400/404) re-initializes once per page.
 pub fn fetch_tools(
     endpoint: &str,
     extra_headers: &[(String, String)],
@@ -124,82 +186,56 @@ pub fn fetch_tools(
     protocol_version: &str,
     client_name: &str,
     client_version: &str,
+    verbose: bool,
 ) -> Result<(ServerInfo, Vec<McpTool>), FetchError> {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs.max(1)))
         .build()
         .map_err(|e| FetchError::Transport(trim_error(e.to_string())))?;
-
-    let initialize = json!({
-        "jsonrpc": "2.0",
-        "id": 0,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": protocol_version,
-            "capabilities": {},
-            "clientInfo": {"name": client_name, "version": client_version},
-        },
-    });
-    let response = post(&client, endpoint, extra_headers, None, None, &initialize)?;
-    let session = session_id(&response);
-    let payload = rpc_body(response)?;
-    let result = rpc::rpc_result(&payload).map_err(FetchError::Rpc)?;
-    let negotiated = result
-        .get("protocolVersion")
-        .and_then(Value::as_str)
-        .unwrap_or(protocol_version)
-        .to_owned();
-    let server = result.get("serverInfo");
-    let info = ServerInfo {
-        name: server
-            .and_then(|s| s.get("name"))
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_owned(),
-        version: server
-            .and_then(|s| s.get("version"))
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_owned(),
-        protocol_version: negotiated.clone(),
+    let session = FetchSession {
+        client: &client,
+        endpoint,
+        extra_headers,
+        offered: protocol_version,
+        client_name,
+        client_version,
+        verbose,
+        next_id: std::cell::Cell::new(0_u64),
     };
+
+    let (info, mut session_id, mut negotiated) = session.initialize()?;
 
     // Best effort: some servers require it before tools/list, others 404 it.
     let notice = json!({
         "jsonrpc": "2.0",
         "method": "notifications/initialized",
     });
-    let _ignored = post(
-        &client,
-        endpoint,
-        extra_headers,
-        session.as_deref(),
-        Some(&negotiated),
-        &notice,
-    );
+    let _ignored = session.post(session_id.as_deref(), Some(&negotiated), &notice);
 
     let mut tools = Vec::new();
     let mut cursor: Option<String> = None;
-    for _ in 0..100 {
+    for _ in 0..MAX_PAGES {
         let mut params = serde_json::Map::new();
         if let Some(next) = &cursor {
             params.insert("cursor".to_string(), Value::String(next.clone()));
         }
+        let id = session.claim_id();
         let list = json!({
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": id,
             "method": "tools/list",
             "params": params,
         });
-        let response = post(
-            &client,
-            endpoint,
-            extra_headers,
-            session.as_deref(),
-            Some(&negotiated),
-            &list,
-        )?;
+        let response = match session.post(session_id.as_deref(), Some(&negotiated), &list) {
+            Err(FetchError::Status(400 | 404)) => {
+                session.log("session rejected; re-initializing once");
+                (_, session_id, negotiated) = session.initialize()?;
+                session.post(session_id.as_deref(), Some(&negotiated), &list)?
+            }
+            other => other?,
+        };
         let payload = rpc_body(response)?;
+        check_id(&payload, id)?;
         let result = rpc::rpc_result(&payload).map_err(FetchError::Rpc)?;
         let listed = result
             .get("tools")
@@ -207,16 +243,136 @@ pub fn fetch_tools(
             .ok_or_else(|| FetchError::Body("tools/list result had no tools array".to_string()))?;
         for tool in listed {
             tools.push(parse_tool(tool)?);
+            if tools.len() > MAX_TOOLS {
+                return Err(FetchError::Body(format!(
+                    "server listed more than {MAX_TOOLS} tools"
+                )));
+            }
         }
         cursor = result
             .get("nextCursor")
             .and_then(Value::as_str)
+            .filter(|next| !next.is_empty())
             .map(str::to_owned);
         if cursor.is_none() {
             break;
         }
     }
+    if cursor.is_some() {
+        return Err(FetchError::Body(format!(
+            "tools/list pagination did not end after {MAX_PAGES} pages"
+        )));
+    }
     Ok((info, tools))
+}
+
+struct FetchSession<'a> {
+    client: &'a Client,
+    endpoint: &'a str,
+    extra_headers: &'a [(String, String)],
+    offered: &'a str,
+    client_name: &'a str,
+    client_version: &'a str,
+    verbose: bool,
+    next_id: std::cell::Cell<u64>,
+}
+
+impl FetchSession<'_> {
+    fn log(&self, message: &str) {
+        if self.verbose {
+            eprintln!("fetch: {message}");
+        }
+    }
+
+    fn claim_id(&self) -> u64 {
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        id
+    }
+
+    fn initialize(&self) -> Result<(ServerInfo, Option<String>, String), FetchError> {
+        let id = self.claim_id();
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": self.offered,
+                "capabilities": {},
+                "clientInfo": {"name": self.client_name, "version": self.client_version},
+            },
+        });
+        let response = self.post(None, None, &body)?;
+        let session = session_id(&response);
+        let payload = rpc_body(response)?;
+        check_id(&payload, id)?;
+        let result = rpc::rpc_result(&payload).map_err(FetchError::Rpc)?;
+        let negotiated = result
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .unwrap_or(self.offered)
+            .to_owned();
+        let server = result.get("serverInfo");
+        let info = ServerInfo {
+            name: server
+                .and_then(|s| s.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+            version: server
+                .and_then(|s| s.get("version"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+            protocol_version: negotiated.clone(),
+        };
+        Ok((info, session, negotiated))
+    }
+
+    /// POSTs once, retrying transient failures with bounded backoff.
+    fn post(
+        &self,
+        session: Option<&str>,
+        protocol_version: Option<&str>,
+        body: &Value,
+    ) -> Result<Response, FetchError> {
+        let mut attempt = 0_u32;
+        loop {
+            attempt += 1;
+            match post_once(
+                self.client,
+                self.endpoint,
+                self.extra_headers,
+                session,
+                protocol_version,
+                body,
+            ) {
+                Ok(response) => return Ok(response),
+                Err((error, retryable)) if retryable && attempt < MAX_ATTEMPTS => {
+                    self.log(&format!("attempt {attempt} failed ({error}); retrying"));
+                    std::thread::sleep(std::time::Duration::from_millis(200 * u64::from(attempt)));
+                }
+                Err((error, _)) => return Err(error),
+            }
+        }
+    }
+}
+
+/// Verifies a JSON-RPC response carries the request's id.
+fn check_id(payload: &Value, expected: u64) -> Result<(), FetchError> {
+    let matches = payload.get("id").is_some_and(|id| {
+        id.as_u64() == Some(expected)
+            || id
+                .as_i64()
+                .is_some_and(|got| got >= 0 && got as u64 == expected)
+    });
+    if matches {
+        Ok(())
+    } else {
+        Err(FetchError::Body(format!(
+            "response id did not match request {expected}"
+        )))
+    }
 }
 
 fn parse_tool(tool: &Value) -> Result<McpTool, FetchError> {
@@ -239,17 +395,19 @@ fn parse_tool(tool: &Value) -> Result<McpTool, FetchError> {
         destructive: annotations
             .and_then(|a| a.get("destructiveHint"))
             .and_then(Value::as_bool),
+        raw: tool.clone(),
     })
 }
 
-fn post(
+/// One POST attempt. The flag says whether the failure is worth retrying.
+fn post_once(
     client: &Client,
     endpoint: &str,
     extra_headers: &[(String, String)],
     session: Option<&str>,
     protocol_version: Option<&str>,
     body: &Value,
-) -> Result<Response, FetchError> {
+) -> Result<Response, (FetchError, bool)> {
     let mut request = client
         .post(endpoint)
         .header("content-type", "application/json")
@@ -263,14 +421,25 @@ fn post(
     if let Some(version) = protocol_version {
         request = request.header("mcp-protocol-version", version);
     }
-    let response = request
-        .json(body)
-        .send()
-        .map_err(|e| FetchError::Transport(trim_error(e.to_string())))?;
-    if !response.status().is_success() {
-        return Err(FetchError::Status(response.status().as_u16()));
+    let response = match request.json(body).send() {
+        Ok(response) => response,
+        Err(error) => {
+            let retryable = error.is_timeout() || error.is_connect();
+            return Err((
+                FetchError::Transport(trim_error(error.to_string())),
+                retryable,
+            ));
+        }
+    };
+    let status = response.status().as_u16();
+    if response.status().is_success() {
+        return Ok(response);
     }
-    Ok(response)
+    if matches!(status, 401 | 403 | 407) {
+        return Err((FetchError::Unauthorized(status), false));
+    }
+    let retryable = matches!(status, 500 | 502 | 503 | 504);
+    Err((FetchError::Status(status), retryable))
 }
 
 fn rpc_body(response: Response) -> Result<Value, FetchError> {
@@ -304,6 +473,15 @@ fn trim_error(message: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn response_ids_must_match() {
+        assert!(check_id(&json!({"id": 3}), 3).is_ok());
+        assert!(check_id(&json!({"id": 3}), 4).is_err());
+        assert!(check_id(&json!({}), 0).is_err());
+        assert!(check_id(&json!({"id": "3"}), 3).is_err());
+    }
 
     #[test]
     fn endpoints_validate_like_base() {

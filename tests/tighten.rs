@@ -15,9 +15,10 @@ fn tool(name: &str, schema: Value) -> McpTool {
     McpTool {
         name: name.to_string(),
         description: Some(format!("Tool {name}")),
-        input_schema: schema,
+        input_schema: schema.clone(),
         read_only: None,
         destructive: None,
+        raw: json!({"name": name, "inputSchema": schema}),
     }
 }
 
@@ -370,6 +371,87 @@ fn capability_names_dedupe_within_a_provider() {
     .unwrap();
     assert_eq!(first.cap_name, "foo-bar");
     assert_eq!(second.cap_name, "foo-bar-2");
+}
+
+#[test]
+fn pathological_schemas_never_panic() {
+    let horrors = vec![
+        json!({"type": "object", "properties": {"x": {"type": 42}}}),
+        json!({"type": "object", "properties": {"x": [1, 2, 3]}}),
+        json!({"type": "object", "properties": Value::Null}),
+        json!({"type": "object", "required": "query"}),
+        json!({"type": "object", "properties": {"x": {"oneOf": "nope"}}}),
+        json!({"type": "object", "properties": {"x": {"allOf": []}}}),
+        json!({"type": "object", "properties": {"x": {"type": ["string", 7]}}}),
+        json!({"type": "object", "properties": {"x": {"enum": []}}}),
+        json!({"type": "object", "properties": {"": {"type": "string"}}}),
+        json!({"type": "object", "properties": {"x": {"type": "array", "items": [1]}}}),
+        json!({"type": "object", "properties": {"x": {"$ref": 7}}}),
+        json!({"type": "object", "properties": {"x": {"anyOf": [{}, {}]}}}),
+    ];
+    for schema in horrors {
+        let _ = tighten(schema);
+    }
+}
+
+#[test]
+fn deep_nesting_skips_instead_of_recursing() {
+    let mut inner = json!({"type": "string"});
+    for _ in 0..40 {
+        inner = json!({
+            "type": "object",
+            "properties": {"nested": inner},
+        });
+    }
+    let schema = json!({"type": "object", "properties": {"top": inner}});
+    let error = tighten(schema).unwrap_err();
+    assert!(error.starts_with("schema-too-deep"), "{error}");
+}
+
+#[test]
+fn pointer_refs_resolve() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "original": {
+                "type": "object",
+                "properties": {"x": {"type": "string"}},
+                "required": ["x"],
+            },
+            "alias": {"$ref": "#/properties/original"},
+        },
+        "required": ["original", "alias"],
+    });
+    snapshot("tighten_pointer_refs", &tighten(schema).unwrap());
+}
+
+#[test]
+fn combined_branches_resolve_through_refs() {
+    let schema = json!({
+        "type": "object",
+        "$defs": {
+            "A": {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]},
+            "B": {"type": "object", "properties": {"b": {"type": "integer"}}},
+        },
+        "properties": {
+            "either": {"oneOf": [{"$ref": "#/$defs/A"}, {"$ref": "#/$defs/B"}]},
+            "both": {"allOf": [{"$ref": "#/$defs/A"}, {"$ref": "#/$defs/B"}]},
+        },
+        "required": ["either", "both"],
+    });
+    snapshot("tighten_ref_combined", &tighten(schema).unwrap());
+}
+
+#[test]
+fn empty_object_properties_lower() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "options": {"type": "object"},
+            "anything": {},
+        },
+    });
+    snapshot("tighten_empty_object", &tighten(schema).unwrap());
 }
 
 #[test]

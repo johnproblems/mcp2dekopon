@@ -86,6 +86,66 @@ providerSettings:
     baseUrl: https://mcp.example.test/mcp
 ```
 
+### Reviewing report.json
+
+Every run writes `<out>/report.json`. Review it before installing:
+
+1. `summary` — how many tools were listed, generated, and skipped.
+2. `warnings` — looseness the generator accepted (for example
+   `enum-not-constrained`), with the capabilities each code touches.
+3. `skipped` — tools left out, each with a reason, detail, and description.
+4. Each capability's `effect`/`risk` — the generator defaults to
+   `external-write`/`Medium`; confirm every `read-only` before granting the
+   provider's `read-only` Cedar group.
+
+```json
+{
+  "generator": "mcp2dekopon",
+  "generator_version": "0.1.0",
+  "sdk_version": "0.46.1",
+  "generated_at": "2026-10-13T00:00:00Z",
+  "summary": { "listed": 6, "generated": 5, "skipped": 1, "providers": 1 },
+  "server": {
+    "url": "http://127.0.0.1:PORT/mcp",
+    "name": "mock-mcp",
+    "version": "0.0.0",
+    "protocol_version": "2025-06-18"
+  },
+  "providers": [
+    {
+      "id": "mockmcp",
+      "dir": "./out/mockmcp",
+      "command_word": "mockmcp",
+      "capabilities": [
+        {
+          "name": "search",
+          "tool": "search",
+          "effect": "read-only",
+          "risk": "Low",
+          "flags": [],
+          "warnings": ["enum-not-constrained"]
+        }
+      ]
+    }
+  ],
+  "warnings": [
+    {
+      "code": "enum-not-constrained",
+      "count": 1,
+      "capabilities": ["mockmcp.search"]
+    }
+  ],
+  "skipped": [
+    {
+      "tool": "recurse",
+      "reason": "recursive-schema",
+      "detail": "reference \"#/$defs/Node\" is recursive",
+      "description": "Never inlines."
+    }
+  ]
+}
+```
+
 ## CLI reference
 
 ```text
@@ -100,11 +160,35 @@ mcp2dekopon gen --url <URL> --id <ID> --out <DIR> [options]
 | `--header NAME:VALUE` | Extra fetch header, repeatable (e.g. `Authorization: Bearer …`). Used only to fetch the tool list; never written to generated files. |
 | `--timeout-secs` | Per-request fetch timeout (default 30). |
 | `--protocol-version` | MCP protocol version to offer (default `2025-06-18`). |
+| `--dry-run` | Fetch and tighten, print the summary, write nothing. |
+| `--save-tools <path>` | Fetch the tool list, save it as JSON, stop before generating. |
+| `--from-file <path>` | Generate from a saved tool list instead of fetching. |
+| `--quiet` / `--verbose` | Print only warnings and errors / log every fetch attempt. |
 | `--force` | Overwrite existing provider directories. |
+
+`mcp2dekopon completions <shell>` prints shell completions for bash, zsh, fish,
+powershell, or elvish.
 
 Exit status is 0 on success, 1 with a message on stderr otherwise. When the
 server lists tools but none survive tightening, the report is still written
 and the exit explains how many were skipped and why.
+
+### Offline regeneration
+
+`--save-tools` and `--from-file` split fetching from rendering, so a
+connected host can capture the tool list and an air-gapped build host can
+render it:
+
+```sh
+# Connected host: capture the tool list (stops before generating).
+mcp2dekopon gen --url https://mcp.example.test/mcp --id example --out ./out --save-tools tools.json
+# Build host: render from the capture. --url is still required: it becomes the
+# vendor default baked into the provider, but no request is ever sent to it.
+mcp2dekopon gen --url https://mcp.example.test/mcp --id example --out ./out --from-file tools.json
+```
+
+The replayed report is identical to the live one except for `generated_at`
+(covered by `replayed_report_matches_the_live_report`).
 
 ## How it works
 

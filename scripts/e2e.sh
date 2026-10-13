@@ -30,6 +30,9 @@ echo "== generate =="
 cat "$work/report.json"
 
 provider="$work/mockmcp"
+echo "== generated code hygiene =="
+cargo fmt --manifest-path "$provider/Cargo.toml" --check
+cargo clippy --manifest-path "$provider/Cargo.toml" --all-targets -- -D warnings
 echo "== native tests (fake broker e2e) =="
 cargo test --manifest-path "$provider/Cargo.toml" -- --nocapture
 

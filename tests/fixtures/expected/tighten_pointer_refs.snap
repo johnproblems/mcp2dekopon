@@ -1,0 +1,52 @@
+{
+  "mcp_name": "probe",
+  "cap_name": "probe",
+  "description": "Tool probe",
+  "fields": [
+    {
+      "mcp_name": "alias",
+      "rust_name": "alias",
+      "type": {
+        "Object": {
+          "type_name": "ProbeAlias",
+          "fields": [
+            {
+              "mcp_name": "x",
+              "rust_name": "x",
+              "type": "String",
+              "required": true,
+              "description": ""
+            }
+          ]
+        }
+      },
+      "required": true,
+      "description": ""
+    },
+    {
+      "mcp_name": "original",
+      "rust_name": "original",
+      "type": {
+        "Object": {
+          "type_name": "ProbeOriginal",
+          "fields": [
+            {
+              "mcp_name": "x",
+              "rust_name": "x",
+              "type": "String",
+              "required": true,
+              "description": ""
+            }
+          ]
+        }
+      },
+      "required": true,
+      "description": ""
+    }
+  ],
+  "top_level_map": false,
+  "effect": "ExternalWrite",
+  "risk": "Medium",
+  "flags": [],
+  "warnings": []
+}

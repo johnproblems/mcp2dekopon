@@ -35,6 +35,9 @@ print('split ok:', ids, counts)
 "
 
 for part in bigmock-1 bigmock-2; do
+  echo "== hygiene: $part =="
+  cargo fmt --manifest-path "$work/$part/Cargo.toml" --check
+  cargo clippy --manifest-path "$work/$part/Cargo.toml" --all-targets -- -D warnings
   echo "== native tests: $part =="
   cargo test --manifest-path "$work/$part/Cargo.toml" -- --nocapture 2>&1 | grep -E "test result|error" | head -5
 done

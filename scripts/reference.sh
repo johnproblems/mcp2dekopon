@@ -31,6 +31,9 @@ caps = sum(len(p['capabilities']) for p in report['providers'])
 print('capabilities:', caps, 'skipped:', [(s['tool'], s['reason']) for s in report['skipped']])
 "
   for dir in $dirs; do
+    echo "-- hygiene: $dir --"
+    cargo fmt --manifest-path "$work/$name/$dir/Cargo.toml" --check
+    cargo clippy --manifest-path "$work/$name/$dir/Cargo.toml" --all-targets -- -D warnings
     echo "-- native tests: $dir --"
     cargo test --manifest-path "$work/$name/$dir/Cargo.toml" 2>&1 | grep -E "test result|error" | head -5
     echo "-- wasm build + conformance: $dir --"

@@ -197,7 +197,12 @@ struct Context<'a> {
     tool_path: String,
     flags: BTreeSet<String>,
     warnings: BTreeSet<String>,
+    depth: usize,
 }
+
+/// Nesting deeper than this is skipped instead of expanded: real tool schemas
+/// stay far below it, and it bounds codegen recursion.
+const MAX_SCHEMA_DEPTH: usize = 16;
 
 /// Tightens one tool. `used_names` dedupes capability names within a provider,
 /// `max_name_len` keeps `provider.name` inside the identifier limit, and
@@ -220,6 +225,7 @@ pub fn tighten_tool(
         tool_path: cap_name.clone(),
         flags: BTreeSet::new(),
         warnings: BTreeSet::new(),
+        depth: 0,
     };
     ctx.defs = collect_defs(&tool.input_schema);
     let result = tighten_inner(tool, &cap_name, effect, risk, &mut ctx);
@@ -479,7 +485,16 @@ where
     if let Some(target) = schema.get("$ref").and_then(Value::as_str) {
         return convert_ref(target, ctx, path);
     }
-    convert_inner(schema, ctx, path)
+    if ctx.depth >= MAX_SCHEMA_DEPTH {
+        return Err(Skip::new(
+            "schema-too-deep",
+            format!("schema nesting exceeds {MAX_SCHEMA_DEPTH} levels"),
+        ));
+    }
+    ctx.depth += 1;
+    let result = convert_inner(schema, ctx, path);
+    ctx.depth -= 1;
+    result
 }
 
 /// Converts through a `$ref`, holding the target on the stack for the whole
@@ -497,7 +512,16 @@ fn convert_ref<'a>(
     }
     let resolved = resolve_chain(target, ctx)?;
     ctx.visiting.push(target.to_string());
+    if ctx.depth >= MAX_SCHEMA_DEPTH {
+        ctx.visiting.pop();
+        return Err(Skip::new(
+            "schema-too-deep",
+            format!("schema nesting exceeds {MAX_SCHEMA_DEPTH} levels"),
+        ));
+    }
+    ctx.depth += 1;
     let result = convert_inner(resolved, ctx, path);
+    ctx.depth -= 1;
     ctx.visiting.pop();
     result
 }

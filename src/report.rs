@@ -11,6 +11,7 @@ pub struct SkippedTool {
     pub tool: String,
     pub reason: String,
     pub detail: String,
+    pub description: String,
 }
 
 /// One generated capability as recorded in the report.
@@ -46,14 +47,34 @@ pub struct ReportProvider {
     pub capabilities: Vec<ReportCapability>,
 }
 
+/// Totals across the whole run, so operators can audit a report at a glance.
+#[derive(Clone, Debug, Serialize)]
+pub struct ReportSummary {
+    pub listed: usize,
+    pub generated: usize,
+    pub skipped: usize,
+    pub providers: usize,
+}
+
+/// One distinct tighten warning, aggregated over every capability that raised it.
+#[derive(Clone, Debug, Serialize)]
+pub struct ReportWarning {
+    pub code: String,
+    pub count: usize,
+    pub capabilities: Vec<String>,
+}
+
 /// The full generation report, written to `<out>/report.json`.
 #[derive(Clone, Debug, Serialize)]
 pub struct GenerationReport {
     pub generator: String,
     pub generator_version: String,
     pub sdk_version: String,
+    pub generated_at: String,
+    pub summary: ReportSummary,
     pub server: ReportServer,
     pub providers: Vec<ReportProvider>,
+    pub warnings: Vec<ReportWarning>,
     pub skipped: Vec<SkippedTool>,
 }
 
@@ -65,16 +86,69 @@ pub struct ReportServer {
     pub protocol_version: String,
 }
 
+/// Unix seconds rendered as RFC 3339 UTC (`1970-01-01T00:00:00Z`), without a
+/// date dependency. Civil-date conversion is Howard Hinnant's algorithm.
+pub fn unix_to_rfc3339(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3_600,
+        rem % 3_600 / 60,
+        rem % 60
+    )
+}
+
+fn now_rfc3339() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    unix_to_rfc3339(secs)
+}
+
 pub fn build_report(
     endpoint: &str,
     server: &ServerInfo,
+    listed: usize,
     providers: Vec<(String, String, Vec<TightenedTool>)>,
     skipped: Vec<SkippedTool>,
 ) -> GenerationReport {
+    let mut by_code: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut generated = 0;
+    for (id, _, tools) in &providers {
+        for tool in tools {
+            generated += 1;
+            for warning in &tool.warnings {
+                by_code
+                    .entry(warning.clone())
+                    .or_default()
+                    .push(format!("{id}.{}", tool.cap_name));
+            }
+        }
+    }
     GenerationReport {
         generator: "mcp2dekopon".to_string(),
         generator_version: env!("CARGO_PKG_VERSION").to_string(),
         sdk_version: crate::SDK_VERSION.to_string(),
+        generated_at: now_rfc3339(),
+        summary: ReportSummary {
+            listed,
+            generated,
+            skipped: skipped.len(),
+            providers: providers.len(),
+        },
         server: ReportServer {
             url: endpoint.to_string(),
             name: server.name.clone(),
@@ -90,6 +164,33 @@ pub fn build_report(
                 capabilities: tools.iter().map(ReportCapability::from_tool).collect(),
             })
             .collect(),
+        warnings: by_code
+            .into_iter()
+            .map(|(code, mut capabilities)| {
+                capabilities.sort();
+                capabilities.dedup();
+                let count = capabilities.len();
+                ReportWarning {
+                    code,
+                    count,
+                    capabilities,
+                }
+            })
+            .collect(),
         skipped,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unix_to_rfc3339;
+
+    #[test]
+    fn epoch_and_known_dates_render_as_rfc3339() {
+        assert_eq!(unix_to_rfc3339(0), "1970-01-01T00:00:00Z");
+        // `date -u -d @1700000000` ground truth.
+        assert_eq!(unix_to_rfc3339(1_700_000_000), "2023-11-14T22:13:20Z");
+        // Leap day, `date -u -d @951827696` ground truth.
+        assert_eq!(unix_to_rfc3339(951_827_696), "2000-02-29T12:34:56Z");
     }
 }

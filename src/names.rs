@@ -241,7 +241,7 @@ fn is_rust_keyword(word: &str) -> bool {
 }
 
 /// Derives a crate name from a provider id (`-`/`.` become `_`, digit start
-/// gets an `mcp_` prefix).
+/// gets an `mcp_` prefix, Rust keywords get a `_provider` suffix).
 pub fn crate_name(provider_id: &str) -> String {
     let mut name: String = provider_id
         .chars()
@@ -249,6 +249,9 @@ pub fn crate_name(provider_id: &str) -> String {
         .collect();
     if name.starts_with(|c: char| c.is_ascii_digit()) {
         name = format!("mcp_{name}");
+    }
+    if is_rust_keyword(&name) || name == "self" || name == "Self" || name == "_" {
+        name = format!("{name}_provider");
     }
     name
 }
@@ -322,5 +325,21 @@ mod tests {
         assert_eq!(crate_name("deepwiki"), "deepwiki");
         assert_eq!(crate_name("my-mcp.v2"), "my_mcp_v2");
         assert_eq!(crate_name("2fast"), "mcp_2fast");
+        assert_eq!(crate_name("type"), "type_provider");
+        assert_eq!(crate_name("self"), "self_provider");
+    }
+
+    #[test]
+    fn long_tool_names_truncate_to_fit() {
+        let mut used = HashSet::new();
+        let name = sanitize_tool_name(&"a".repeat(300), &mut used, 253).unwrap();
+        assert_eq!(name.len(), 253);
+        let dup = sanitize_tool_name(&"a".repeat(300), &mut used, 253).unwrap();
+        assert!(dup.len() <= 253 && dup.ends_with("-2"), "{dup}");
+        let tiny = sanitize_tool_name("tool-name", &mut HashSet::new(), 3).unwrap();
+        assert_eq!(tiny, "too");
+        // Separators exposed by the cut are trimmed, not left dangling.
+        let cut = sanitize_tool_name("ab-cdef", &mut HashSet::new(), 3).unwrap();
+        assert_eq!(cut, "ab");
     }
 }

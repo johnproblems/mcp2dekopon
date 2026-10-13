@@ -6,13 +6,13 @@
 
 use dekopon_provider_sdk::clap::{Args, Parser, Subcommand};
 use dekopon_provider_sdk::provider::{
-    Capability, Code, Failure, Header, Http, HttpBuildError, HttpError, Proposal, Provider,
-    Request, Response, Settings, Stdout, Usage, endpoint::Base, method,
+    endpoint::Base, method, Capability, Code, Failure, Header, Http, HttpBuildError, HttpError,
+    Proposal, Provider, Request, Response, Settings, Stdout, Usage,
 };
 use dekopon_provider_sdk::{EffectKind, RiskLevel};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::io::Write;
 
 /// MCP protocol version offered in `initialize`.
@@ -30,6 +30,10 @@ pub struct McpSettings {
     base_url: Option<Base>,
 }
 
+/// Client identity sent in `initialize`.
+const CLIENT_NAME: &str = "mockmcp";
+const CLIENT_VERSION: &str = "0.1.0";
+
 /// Every way an MCP call can fail.
 #[derive(Debug)]
 pub enum McpError {
@@ -37,7 +41,10 @@ pub enum McpError {
     Http(HttpError),
     HttpStatus(u16),
     Protocol(&'static str),
-    Rpc { code: i64, message: String },
+    Rpc {
+        code: i64,
+        message: String,
+    },
     ToolFailed,
     Encoding,
     Output,
@@ -169,7 +176,75 @@ fn rpc_result(payload: &Value) -> Result<&Value, McpError> {
 fn init_protocol(response: &Response) -> Option<String> {
     let payload = parse_rpc_body(&response.body, content_type_of(response)).ok()?;
     let result = rpc_result(&payload).ok()?;
-    result.get("protocolVersion").and_then(Value::as_str).map(str::to_owned)
+    result
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Runs one MCP round trip against `base`: `initialize`, then
+/// `tools/call` for `tool`, printing the MCP `content` as one JSON line.
+fn call_mcp(
+    http: &Http,
+    base: &Base,
+    tool: &'static str,
+    arguments: Value,
+    out: &mut Stdout,
+) -> Result<(), McpError> {
+    let url = base.as_str().to_owned();
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION},
+        },
+    });
+    let init_request = Request::new(method::POST, &url)
+        .map_err(McpError::InvalidRequest)?
+        .with_header(ht("content-type", "application/json")?)
+        .with_header(ht("accept", "application/json, text/event-stream")?)
+        .with_body(initialize.to_string().into_bytes());
+    let init_response = http.send(init_request).map_err(McpError::Http)?;
+    if !(200..300).contains(&init_response.status) {
+        return Err(McpError::HttpStatus(init_response.status));
+    }
+    let session = header_bytes(&init_response, "mcp-session-id").map(<[u8]>::to_vec);
+    let protocol = init_protocol(&init_response).unwrap_or_else(|| MCP_PROTOCOL_VERSION.to_owned());
+    let call = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {"name": tool, "arguments": arguments},
+    });
+    let mut call_request = Request::new(method::POST, &url)
+        .map_err(McpError::InvalidRequest)?
+        .with_header(ht("content-type", "application/json")?)
+        .with_header(ht("accept", "application/json, text/event-stream")?)
+        .with_header(ht("mcp-protocol-version", &protocol)?);
+    if let Some(session) = session {
+        call_request = call_request.with_header(hb("mcp-session-id", session)?);
+    }
+    let call_request = call_request.with_body(call.to_string().into_bytes());
+    let call_response = http.send(call_request).map_err(McpError::Http)?;
+    if !(200..300).contains(&call_response.status) {
+        return Err(McpError::HttpStatus(call_response.status));
+    }
+    let payload = parse_rpc_body(&call_response.body, content_type_of(&call_response))?;
+    let result = rpc_result(&payload)?;
+    let content = result.get("content").unwrap_or(result);
+    let line = serde_json::to_string(content).map_err(|_| McpError::Encoding)?;
+    writeln!(out, "{line}").map_err(|_| McpError::Output)?;
+    if result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(McpError::ToolFailed);
+    }
+    Ok(())
 }
 
 /// Parses free-map fields from JSON text in place; arrays are descended so
@@ -183,8 +258,8 @@ fn parse_json_field_path(value: &mut Value, path: &[&'static str]) -> Result<(),
             None => Ok(()),
             Some(next) if tail.is_empty() => {
                 if let Value::String(text) = next {
-                    let parsed: Value = serde_json::from_str(text)
-                        .map_err(|_| McpError::InvalidArguments(*head))?;
+                    let parsed: Value =
+                        serde_json::from_str(text).map_err(|_| McpError::InvalidArguments(head))?;
                     *next = parsed;
                 }
                 Ok(())
@@ -214,6 +289,8 @@ pub struct SearchInput {
     /// The question.
     #[serde(rename = "query")]
     query: String,
+    #[serde(rename = "sort", skip_serializing_if = "Option::is_none")]
+    sort: Option<String>,
 }
 
 /// CLI flags for `mockmcp search`.
@@ -224,6 +301,8 @@ pub struct SearchArgs {
     /// The question.
     #[arg(long, required = true)]
     query: String,
+    #[arg(long)]
+    sort: Option<String>,
 }
 
 // ---- get_details ----
@@ -392,8 +471,7 @@ fn parse_required_arg<T: serde::de::DeserializeOwned>(
     flag: &'static str,
     raw: String,
 ) -> Result<T, Usage> {
-    serde_json::from_str(&raw)
-        .map_err(|_| Usage::new(format!("{tool}: --{flag} must be JSON")))
+    serde_json::from_str(&raw).map_err(|_| Usage::new(format!("{tool}: --{flag} must be JSON")))
 }
 
 impl Capability for SearchCap {
@@ -411,61 +489,12 @@ impl Capability for SearchCap {
         (settings, http): (Settings<McpSettings>, Http),
         out: &mut Stdout,
     ) -> Result<(), McpError> {
-        let base = settings.into_inner().base_url.unwrap_or_else(|| VENDOR_BASE.clone());
-        let arguments =
-            serde_json::to_value(&input).map_err(|_| McpError::Encoding)?;
-        let url = base.as_str().to_owned();
-        let initialize = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "mockmcp", "version": "0.1.0"},
-            },
-        });
-        let init_request = Request::new(method::POST, &url)
-            .map_err(McpError::InvalidRequest)?
-            .with_header(ht("content-type", "application/json")?)
-            .with_header(ht("accept", "application/json, text/event-stream")?)
-            .with_body(initialize.to_string().into_bytes());
-        let init_response = http.send(init_request).map_err(McpError::Http)?;
-        if !(200..300).contains(&init_response.status) {
-            return Err(McpError::HttpStatus(init_response.status));
-        }
-        let session =
-            header_bytes(&init_response, "mcp-session-id").map(<[u8]>::to_vec);
-        let protocol =
-            init_protocol(&init_response).unwrap_or_else(|| MCP_PROTOCOL_VERSION.to_owned());
-        let call = json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {"name": "search", "arguments": arguments},
-        });
-        let mut call_request = Request::new(method::POST, &url)
-            .map_err(McpError::InvalidRequest)?
-            .with_header(ht("content-type", "application/json")?)
-            .with_header(ht("accept", "application/json, text/event-stream")?)
-            .with_header(ht("mcp-protocol-version", &protocol)?);
-        if let Some(session) = session {
-            call_request = call_request.with_header(hb("mcp-session-id", session)?);
-        }
-        let call_request = call_request.with_body(call.to_string().into_bytes());
-        let call_response = http.send(call_request).map_err(McpError::Http)?;
-        if !(200..300).contains(&call_response.status) {
-            return Err(McpError::HttpStatus(call_response.status));
-        }
-        let payload = parse_rpc_body(&call_response.body, content_type_of(&call_response))?;
-        let result = rpc_result(&payload)?;
-        let content = result.get("content").unwrap_or(result);
-        let line = serde_json::to_string(content).map_err(|_| McpError::Encoding)?;
-        writeln!(out, "{line}").map_err(|_| McpError::Output)?;
-        if result.get("isError").and_then(Value::as_bool).unwrap_or(false) {
-            return Err(McpError::ToolFailed);
-        }
-        Ok(())
+        let base = settings
+            .into_inner()
+            .base_url
+            .unwrap_or_else(|| VENDOR_BASE.clone());
+        let arguments = serde_json::to_value(&input).map_err(|_| McpError::Encoding)?;
+        call_mcp(&http, &base, "search", arguments, out)
     }
 }
 
@@ -484,62 +513,13 @@ impl Capability for GetDetailsCap {
         (settings, http): (Settings<McpSettings>, Http),
         out: &mut Stdout,
     ) -> Result<(), McpError> {
-        let base = settings.into_inner().base_url.unwrap_or_else(|| VENDOR_BASE.clone());
-        let mut arguments =
-            serde_json::to_value(&input).map_err(|_| McpError::Encoding)?;
+        let base = settings
+            .into_inner()
+            .base_url
+            .unwrap_or_else(|| VENDOR_BASE.clone());
+        let mut arguments = serde_json::to_value(&input).map_err(|_| McpError::Encoding)?;
         parse_json_field_path(&mut arguments, &["options", "labels"])?;
-        let url = base.as_str().to_owned();
-        let initialize = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "mockmcp", "version": "0.1.0"},
-            },
-        });
-        let init_request = Request::new(method::POST, &url)
-            .map_err(McpError::InvalidRequest)?
-            .with_header(ht("content-type", "application/json")?)
-            .with_header(ht("accept", "application/json, text/event-stream")?)
-            .with_body(initialize.to_string().into_bytes());
-        let init_response = http.send(init_request).map_err(McpError::Http)?;
-        if !(200..300).contains(&init_response.status) {
-            return Err(McpError::HttpStatus(init_response.status));
-        }
-        let session =
-            header_bytes(&init_response, "mcp-session-id").map(<[u8]>::to_vec);
-        let protocol =
-            init_protocol(&init_response).unwrap_or_else(|| MCP_PROTOCOL_VERSION.to_owned());
-        let call = json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {"name": "get_details", "arguments": arguments},
-        });
-        let mut call_request = Request::new(method::POST, &url)
-            .map_err(McpError::InvalidRequest)?
-            .with_header(ht("content-type", "application/json")?)
-            .with_header(ht("accept", "application/json, text/event-stream")?)
-            .with_header(ht("mcp-protocol-version", &protocol)?);
-        if let Some(session) = session {
-            call_request = call_request.with_header(hb("mcp-session-id", session)?);
-        }
-        let call_request = call_request.with_body(call.to_string().into_bytes());
-        let call_response = http.send(call_request).map_err(McpError::Http)?;
-        if !(200..300).contains(&call_response.status) {
-            return Err(McpError::HttpStatus(call_response.status));
-        }
-        let payload = parse_rpc_body(&call_response.body, content_type_of(&call_response))?;
-        let result = rpc_result(&payload)?;
-        let content = result.get("content").unwrap_or(result);
-        let line = serde_json::to_string(content).map_err(|_| McpError::Encoding)?;
-        writeln!(out, "{line}").map_err(|_| McpError::Output)?;
-        if result.get("isError").and_then(Value::as_bool).unwrap_or(false) {
-            return Err(McpError::ToolFailed);
-        }
-        Ok(())
+        call_mcp(&http, &base, "get_details", arguments, out)
     }
 }
 
@@ -558,61 +538,12 @@ impl Capability for LocateCap {
         (settings, http): (Settings<McpSettings>, Http),
         out: &mut Stdout,
     ) -> Result<(), McpError> {
-        let base = settings.into_inner().base_url.unwrap_or_else(|| VENDOR_BASE.clone());
-        let arguments =
-            serde_json::to_value(&input).map_err(|_| McpError::Encoding)?;
-        let url = base.as_str().to_owned();
-        let initialize = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "mockmcp", "version": "0.1.0"},
-            },
-        });
-        let init_request = Request::new(method::POST, &url)
-            .map_err(McpError::InvalidRequest)?
-            .with_header(ht("content-type", "application/json")?)
-            .with_header(ht("accept", "application/json, text/event-stream")?)
-            .with_body(initialize.to_string().into_bytes());
-        let init_response = http.send(init_request).map_err(McpError::Http)?;
-        if !(200..300).contains(&init_response.status) {
-            return Err(McpError::HttpStatus(init_response.status));
-        }
-        let session =
-            header_bytes(&init_response, "mcp-session-id").map(<[u8]>::to_vec);
-        let protocol =
-            init_protocol(&init_response).unwrap_or_else(|| MCP_PROTOCOL_VERSION.to_owned());
-        let call = json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {"name": "locate", "arguments": arguments},
-        });
-        let mut call_request = Request::new(method::POST, &url)
-            .map_err(McpError::InvalidRequest)?
-            .with_header(ht("content-type", "application/json")?)
-            .with_header(ht("accept", "application/json, text/event-stream")?)
-            .with_header(ht("mcp-protocol-version", &protocol)?);
-        if let Some(session) = session {
-            call_request = call_request.with_header(hb("mcp-session-id", session)?);
-        }
-        let call_request = call_request.with_body(call.to_string().into_bytes());
-        let call_response = http.send(call_request).map_err(McpError::Http)?;
-        if !(200..300).contains(&call_response.status) {
-            return Err(McpError::HttpStatus(call_response.status));
-        }
-        let payload = parse_rpc_body(&call_response.body, content_type_of(&call_response))?;
-        let result = rpc_result(&payload)?;
-        let content = result.get("content").unwrap_or(result);
-        let line = serde_json::to_string(content).map_err(|_| McpError::Encoding)?;
-        writeln!(out, "{line}").map_err(|_| McpError::Output)?;
-        if result.get("isError").and_then(Value::as_bool).unwrap_or(false) {
-            return Err(McpError::ToolFailed);
-        }
-        Ok(())
+        let base = settings
+            .into_inner()
+            .base_url
+            .unwrap_or_else(|| VENDOR_BASE.clone());
+        let arguments = serde_json::to_value(&input).map_err(|_| McpError::Encoding)?;
+        call_mcp(&http, &base, "locate", arguments, out)
     }
 }
 
@@ -631,61 +562,12 @@ impl Capability for EitherCap {
         (settings, http): (Settings<McpSettings>, Http),
         out: &mut Stdout,
     ) -> Result<(), McpError> {
-        let base = settings.into_inner().base_url.unwrap_or_else(|| VENDOR_BASE.clone());
-        let arguments =
-            serde_json::to_value(&input).map_err(|_| McpError::Encoding)?;
-        let url = base.as_str().to_owned();
-        let initialize = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "mockmcp", "version": "0.1.0"},
-            },
-        });
-        let init_request = Request::new(method::POST, &url)
-            .map_err(McpError::InvalidRequest)?
-            .with_header(ht("content-type", "application/json")?)
-            .with_header(ht("accept", "application/json, text/event-stream")?)
-            .with_body(initialize.to_string().into_bytes());
-        let init_response = http.send(init_request).map_err(McpError::Http)?;
-        if !(200..300).contains(&init_response.status) {
-            return Err(McpError::HttpStatus(init_response.status));
-        }
-        let session =
-            header_bytes(&init_response, "mcp-session-id").map(<[u8]>::to_vec);
-        let protocol =
-            init_protocol(&init_response).unwrap_or_else(|| MCP_PROTOCOL_VERSION.to_owned());
-        let call = json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {"name": "either", "arguments": arguments},
-        });
-        let mut call_request = Request::new(method::POST, &url)
-            .map_err(McpError::InvalidRequest)?
-            .with_header(ht("content-type", "application/json")?)
-            .with_header(ht("accept", "application/json, text/event-stream")?)
-            .with_header(ht("mcp-protocol-version", &protocol)?);
-        if let Some(session) = session {
-            call_request = call_request.with_header(hb("mcp-session-id", session)?);
-        }
-        let call_request = call_request.with_body(call.to_string().into_bytes());
-        let call_response = http.send(call_request).map_err(McpError::Http)?;
-        if !(200..300).contains(&call_response.status) {
-            return Err(McpError::HttpStatus(call_response.status));
-        }
-        let payload = parse_rpc_body(&call_response.body, content_type_of(&call_response))?;
-        let result = rpc_result(&payload)?;
-        let content = result.get("content").unwrap_or(result);
-        let line = serde_json::to_string(content).map_err(|_| McpError::Encoding)?;
-        writeln!(out, "{line}").map_err(|_| McpError::Output)?;
-        if result.get("isError").and_then(Value::as_bool).unwrap_or(false) {
-            return Err(McpError::ToolFailed);
-        }
-        Ok(())
+        let base = settings
+            .into_inner()
+            .base_url
+            .unwrap_or_else(|| VENDOR_BASE.clone());
+        let arguments = serde_json::to_value(&input).map_err(|_| McpError::Encoding)?;
+        call_mcp(&http, &base, "either", arguments, out)
     }
 }
 
@@ -704,64 +586,16 @@ impl Capability for RemapCap {
         (settings, http): (Settings<McpSettings>, Http),
         out: &mut Stdout,
     ) -> Result<(), McpError> {
-        let base = settings.into_inner().base_url.unwrap_or_else(|| VENDOR_BASE.clone());
-        let arguments: Value =
-            serde_json::from_str(&input.payload).map_err(|_| McpError::InvalidArguments("payload"))?;
+        let base = settings
+            .into_inner()
+            .base_url
+            .unwrap_or_else(|| VENDOR_BASE.clone());
+        let arguments: Value = serde_json::from_str(&input.payload)
+            .map_err(|_| McpError::InvalidArguments("payload"))?;
         if !arguments.is_object() {
             return Err(McpError::InvalidArguments("payload"));
         }
-        let url = base.as_str().to_owned();
-        let initialize = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "mockmcp", "version": "0.1.0"},
-            },
-        });
-        let init_request = Request::new(method::POST, &url)
-            .map_err(McpError::InvalidRequest)?
-            .with_header(ht("content-type", "application/json")?)
-            .with_header(ht("accept", "application/json, text/event-stream")?)
-            .with_body(initialize.to_string().into_bytes());
-        let init_response = http.send(init_request).map_err(McpError::Http)?;
-        if !(200..300).contains(&init_response.status) {
-            return Err(McpError::HttpStatus(init_response.status));
-        }
-        let session =
-            header_bytes(&init_response, "mcp-session-id").map(<[u8]>::to_vec);
-        let protocol =
-            init_protocol(&init_response).unwrap_or_else(|| MCP_PROTOCOL_VERSION.to_owned());
-        let call = json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {"name": "remap", "arguments": arguments},
-        });
-        let mut call_request = Request::new(method::POST, &url)
-            .map_err(McpError::InvalidRequest)?
-            .with_header(ht("content-type", "application/json")?)
-            .with_header(ht("accept", "application/json, text/event-stream")?)
-            .with_header(ht("mcp-protocol-version", &protocol)?);
-        if let Some(session) = session {
-            call_request = call_request.with_header(hb("mcp-session-id", session)?);
-        }
-        let call_request = call_request.with_body(call.to_string().into_bytes());
-        let call_response = http.send(call_request).map_err(McpError::Http)?;
-        if !(200..300).contains(&call_response.status) {
-            return Err(McpError::HttpStatus(call_response.status));
-        }
-        let payload = parse_rpc_body(&call_response.body, content_type_of(&call_response))?;
-        let result = rpc_result(&payload)?;
-        let content = result.get("content").unwrap_or(result);
-        let line = serde_json::to_string(content).map_err(|_| McpError::Encoding)?;
-        writeln!(out, "{line}").map_err(|_| McpError::Output)?;
-        if result.get("isError").and_then(Value::as_bool).unwrap_or(false) {
-            return Err(McpError::ToolFailed);
-        }
-        Ok(())
+        call_mcp(&http, &base, "remap", arguments, out)
     }
 }
 
@@ -773,12 +607,15 @@ impl Provider for McpProvider {
     const COMMAND_WORDS: &'static [&'static str] = &["mockmcp"];
     const DESCRIPTION: &'static str = "MCP tools from http://127.0.0.1:PORT (mock-mcp 0.0.0)";
     type Args = Command;
+    #[rustfmt::skip]
     type Capabilities = (SearchCap, GetDetailsCap, LocateCap, EitherCap, RemapCap);
+    #[rustfmt::skip]
     fn propose(args: Command, _stdin_piped: bool) -> Result<Proposal<Self>, Usage> {
         match args.action {
             Action::Search(args) => Ok(Proposal::to::<SearchCap>(SearchInput {
                 limit: args.limit,
                 query: args.query,
+                sort: args.sort,
             })),
             Action::GetDetails(args) => Ok(Proposal::to::<GetDetailsCap>(GetDetailsInput {
                 key: args.key,

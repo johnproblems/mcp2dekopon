@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use mcp2dekopon::codegen::{self, ProviderSpec};
 use mcp2dekopon::fetch::{self, Endpoint};
@@ -17,6 +17,10 @@ use mcp2dekopon::tighten::{self, TightenedTool};
 #[command(
     name = "mcp2dekopon",
     version,
+    long_version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (sdk 0.46.1, mcp 2025-06-18)"
+    ),
     about = "Generate Dekopon providers from MCP servers"
 )]
 struct Cli {
@@ -27,90 +31,152 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Fetch tools/list from an MCP server and generate provider crate(s)
-    Gen {
-        /// The MCP Streamable HTTP endpoint, e.g. https://mcp.example.test/mcp
-        #[arg(long)]
-        url: String,
-        /// The provider id (lowercase, digits, '.', '-', '_')
-        #[arg(long)]
-        id: String,
-        /// The output directory; provider crates land in subdirectories
-        #[arg(long)]
-        out: PathBuf,
-        /// An extra request header for fetching, NAME:VALUE; repeatable. Used
-        /// only to fetch the tool list, never written to generated files.
-        #[arg(long)]
-        header: Vec<String>,
-        /// Per-request timeout in seconds
-        #[arg(long, default_value_t = 30)]
-        timeout_secs: u64,
-        /// Overwrite existing provider directories
-        #[arg(long)]
-        force: bool,
-        /// MCP protocol version to offer
-        #[arg(long, default_value = mcp2dekopon::MCP_PROTOCOL_VERSION)]
-        protocol_version: String,
+    #[command(after_long_help = "Examples:\n  \
+        mcp2dekopon gen --url https://mcp.example.test/mcp --id example --out ./out\n  \
+        mcp2dekopon gen --url https://mcp.example.test/mcp --id example --out ./out --dry-run\n  \
+        mcp2dekopon gen --url https://mcp.example.test/mcp --id example --out ./out --save-tools tools.json\n  \
+        mcp2dekopon gen --url https://mcp.example.test/mcp --id example --out ./out --from-file tools.json")]
+    Gen(GenArgs),
+    /// Print shell completions
+    Completions {
+        /// The shell to complete
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
+}
+
+#[derive(clap::Args)]
+struct GenArgs {
+    /// The MCP Streamable HTTP endpoint, e.g. https://mcp.example.test/mcp
+    #[arg(long)]
+    url: String,
+    /// The provider id (lowercase, digits, '.', '-', '_')
+    #[arg(long)]
+    id: String,
+    /// The output directory; provider crates land in subdirectories
+    #[arg(long)]
+    out: PathBuf,
+    /// An extra request header for fetching, NAME:VALUE; repeatable. Used
+    /// only to fetch the tool list, never written to generated files.
+    #[arg(long)]
+    header: Vec<String>,
+    /// Per-request timeout in seconds
+    #[arg(long, default_value_t = 30)]
+    timeout_secs: u64,
+    /// Overwrite existing provider directories
+    #[arg(long)]
+    force: bool,
+    /// MCP protocol version to offer
+    #[arg(long, default_value = mcp2dekopon::MCP_PROTOCOL_VERSION)]
+    protocol_version: String,
+    /// Fetch and tighten, then print the summary without writing anything
+    #[arg(long)]
+    dry_run: bool,
+    /// Generate from a saved tool list (see --save-tools) instead of fetching
+    #[arg(long, conflicts_with = "save_tools")]
+    from_file: Option<PathBuf>,
+    /// Fetch the tool list, save it as JSON, and stop before generating
+    #[arg(long, conflicts_with = "from_file")]
+    save_tools: Option<PathBuf>,
+    /// Print only warnings and errors
+    #[arg(long, conflicts_with = "verbose")]
+    quiet: bool,
+    /// Log every fetch attempt
+    #[arg(long, conflicts_with = "quiet")]
+    verbose: bool,
 }
 
 fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Command::Gen {
-            url,
-            id,
-            out,
-            header,
-            timeout_secs,
-            force,
-            protocol_version,
-        } => {
-            if let Err(message) = run_gen(
-                &url,
-                &id,
-                &out,
-                &header,
-                timeout_secs,
-                force,
-                &protocol_version,
-            ) {
+        Command::Gen(args) => {
+            if let Err(message) = run_gen(&args) {
                 eprintln!("mcp2dekopon: {message}");
                 std::process::exit(1);
             }
         }
+        Command::Completions { shell } => {
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "mcp2dekopon",
+                &mut std::io::stdout(),
+            );
+        }
     }
 }
 
-fn run_gen(
-    url: &str,
-    id: &str,
-    out: &PathBuf,
-    headers: &[String],
-    timeout_secs: u64,
-    force: bool,
-    protocol_version: &str,
-) -> Result<(), String> {
-    let endpoint: Endpoint = fetch::validate_endpoint(url)?;
-    let provider_id = names::validate_provider_id(id)?;
-    let extra_headers = parse_headers(headers)?;
+/// Progress output honoring --quiet.
+struct Log {
+    quiet: bool,
+}
 
-    eprintln!("fetching tools/list from {} ...", endpoint.vendor_base);
-    let (server, listed) = fetch::fetch_tools(
-        &endpoint.vendor_base,
-        &extra_headers,
-        timeout_secs,
-        protocol_version,
-        "mcp2dekopon",
-        env!("CARGO_PKG_VERSION"),
-    )
-    .map_err(|e| e.to_string())?;
-    eprintln!(
+impl Log {
+    fn info(&self, message: &str) {
+        if !self.quiet {
+            eprintln!("{message}");
+        }
+    }
+
+    fn warn(&self, message: &str) {
+        eprintln!("{message}");
+    }
+}
+
+fn run_gen(args: &GenArgs) -> Result<(), String> {
+    if args.timeout_secs == 0 {
+        return Err("--timeout-secs must be at least 1".to_string());
+    }
+    let log = Log { quiet: args.quiet };
+    let endpoint: Endpoint = fetch::validate_endpoint(&args.url)?;
+    let provider_id = names::validate_provider_id(&args.id)?;
+    let extra_headers = parse_headers(&args.header)?;
+
+    let (server, listed) = if let Some(path) = &args.from_file {
+        if !args.header.is_empty() {
+            log.warn("warning: ignoring --header with --from-file (nothing is fetched)");
+        }
+        log.info(&format!("loading tool list from {} ...", path.display()));
+        fetch::SavedTools::load(path)?
+    } else {
+        log.info(&format!(
+            "fetching tools/list from {} ...",
+            endpoint.vendor_base
+        ));
+        fetch::fetch_tools(
+            &endpoint.vendor_base,
+            &extra_headers,
+            args.timeout_secs,
+            &args.protocol_version,
+            "mcp2dekopon",
+            env!("CARGO_PKG_VERSION"),
+            args.verbose,
+        )
+        .map_err(|e| e.to_string())?
+    };
+    log.info(&format!(
         "server {} {} speaks {}; {} tool(s) listed",
         server.name,
         server.version,
         server.protocol_version,
         listed.len()
-    );
+    ));
+    if server.protocol_version != args.protocol_version {
+        log.warn(&format!(
+            "warning: server speaks {}, not the offered {}; proceeding",
+            server.protocol_version, args.protocol_version
+        ));
+    }
+
+    if let Some(path) = &args.save_tools {
+        fetch::SavedTools::save(path, &server, &listed)?;
+        log.info(&format!(
+            "saved {} tool(s) to {}; stopping before generation",
+            listed.len(),
+            path.display()
+        ));
+        return Ok(());
+    }
 
     // Tighten every tool; skips carry reasons into the report.
     let max_name_len = mcp2dekopon::names::MAX_IDENTIFIER_LEN - provider_id.len() - 1;
@@ -122,14 +188,15 @@ fn run_gen(
         match tighten::tighten_tool(tool, &mut used_names, max_name_len, &mut used_types) {
             Ok(ready) => tightened.push(ready),
             Err(skip) => {
-                eprintln!(
+                log.info(&format!(
                     "skipping {:?}: {} ({})",
                     tool.name, skip.reason, skip.detail
-                );
+                ));
                 skipped.push(SkippedTool {
                     tool: tool.name.clone(),
                     reason: skip.reason.to_string(),
                     detail: skip.detail,
+                    description: tool.description.clone().unwrap_or_default(),
                 });
             }
         }
@@ -137,15 +204,29 @@ fn run_gen(
 
     let parts = codegen::split_tools(&provider_id, &tightened)?;
     if parts.len() > 1 {
-        eprintln!(
+        log.info(&format!(
             "splitting {} tools into {} providers of at most {}",
             tightened.len(),
             parts.len(),
             mcp2dekopon::MAX_CAPABILITIES
-        );
+        ));
     }
 
-    std::fs::create_dir_all(out).map_err(|e| format!("cannot create {}: {e}", out.display()))?;
+    if args.dry_run {
+        log.info(&format!(
+            "dry run: {} provider(s), {} capabilities, {} skipped; wrote nothing",
+            parts.len(),
+            tightened.len(),
+            skipped.len()
+        ));
+        if tightened.is_empty() {
+            return Err(format!("no usable tools ({} skipped)", skipped.len()));
+        }
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&args.out)
+        .map_err(|e| format!("cannot create {}: {e}", args.out.display()))?;
     let generator_version = env!("CARGO_PKG_VERSION").to_string();
     let mut providers = Vec::new();
     for ((part_id, part_dir), chunk) in parts
@@ -160,9 +241,13 @@ fn run_gen(
             generator_version: generator_version.clone(),
         };
         let files = codegen::render_provider(&spec);
-        let dir = out.join(part_dir);
-        codegen::write_provider(&dir, &files, force)?;
-        eprintln!("wrote {} ({} capabilities)", dir.display(), chunk.len());
+        let dir = args.out.join(part_dir);
+        codegen::write_provider(&dir, &files, args.force)?;
+        log.info(&format!(
+            "wrote {} ({} capabilities)",
+            dir.display(),
+            chunk.len()
+        ));
         providers.push((
             part_id.clone(),
             part_dir.display().to_string(),
@@ -173,11 +258,12 @@ fn run_gen(
     let report_text = serde_json::to_string_pretty(&report::build_report(
         &endpoint.vendor_base,
         &server,
+        listed.len(),
         providers,
         skipped.clone(),
     ))
     .map_err(|e| format!("cannot encode report: {e}"))?;
-    let report_path = out.join("report.json");
+    let report_path = args.out.join("report.json");
     std::fs::write(&report_path, format!("{report_text}\n"))
         .map_err(|e| format!("cannot write {}: {e}", report_path.display()))?;
 
@@ -188,14 +274,14 @@ fn run_gen(
             report_path.display()
         ));
     }
-    eprintln!(
+    log.info(&format!(
         "done: {} provider(s), {} capabilities, {} skipped; report at {}",
         parts.len(),
         tightened.len(),
         skipped.len(),
         report_path.display()
-    );
-    eprintln!("next: cd into a provider, run ./build.sh, then cargo test");
+    ));
+    log.info("next: cd into a provider, run ./build.sh, then cargo test");
     Ok(())
 }
 
@@ -212,4 +298,20 @@ fn parse_headers(headers: &[String]) -> Result<Vec<(String, String)>, String> {
         parsed.push((name.to_string(), value.trim_start().to_string()));
     }
     Ok(parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    #[test]
+    fn long_version_tracks_pins() {
+        let rendered = Cli::command().render_long_version();
+        assert!(rendered.contains(mcp2dekopon::SDK_VERSION), "{rendered}");
+        assert!(
+            rendered.contains(mcp2dekopon::MCP_PROTOCOL_VERSION),
+            "{rendered}"
+        );
+    }
 }

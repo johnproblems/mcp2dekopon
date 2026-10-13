@@ -105,6 +105,11 @@ pub fn render_provider(spec: &ProviderSpec<'_>) -> Vec<GeneratedFile> {
             content: render_readme(spec),
             executable: false,
         },
+        GeneratedFile {
+            path: ".gitignore".to_string(),
+            content: "/target\n*.wasm\nbuild-target.log\n".to_string(),
+            executable: false,
+        },
     ]
 }
 
@@ -297,13 +302,13 @@ fn render_lib(spec: &ProviderSpec<'_>, naming: &Naming) -> String {
     out.push_str(
         "use dekopon_provider_sdk::clap::{Args, Parser, Subcommand};\n\
          use dekopon_provider_sdk::provider::{\n\
-         \x20   Capability, Code, Failure, Header, Http, HttpBuildError, HttpError, Proposal, Provider,\n\
-         \x20   Request, Response, Settings, Stdout, Usage, endpoint::Base, method,\n\
+         \x20   endpoint::Base, method, Capability, Code, Failure, Header, Http, HttpBuildError, HttpError,\n\
+         \x20   Proposal, Provider, Request, Response, Settings, Stdout, Usage,\n\
          };\n\
          use dekopon_provider_sdk::{EffectKind, RiskLevel};\n\
          use schemars::JsonSchema;\n\
          use serde::{Deserialize, Serialize};\n\
-         use serde_json::{Value, json};\n\
+         use serde_json::{json, Value};\n\
          use std::io::Write;\n\
          \n\
          /// MCP protocol version offered in `initialize`.\n",
@@ -328,6 +333,14 @@ fn render_lib(spec: &ProviderSpec<'_>, naming: &Naming) -> String {
         lit(&spec.endpoint.vendor_base),
         spec.id,
     ));
+    out.push_str(&format!(
+        "/// Client identity sent in `initialize`.\n\
+         const CLIENT_NAME: &str = {};\n\
+         const CLIENT_VERSION: &str = {};\n\
+         \n",
+        lit(&spec.id),
+        lit(&spec.generator_version),
+    ));
     out.push_str(
         "/// Every way an MCP call can fail.\n\
          #[derive(Debug)]\n\
@@ -336,7 +349,10 @@ fn render_lib(spec: &ProviderSpec<'_>, naming: &Naming) -> String {
          \x20   Http(HttpError),\n\
          \x20   HttpStatus(u16),\n\
          \x20   Protocol(&'static str),\n\
-         \x20   Rpc { code: i64, message: String },\n\
+         \x20   Rpc {\n\
+         \x20       code: i64,\n\
+         \x20       message: String,\n\
+         \x20   },\n\
          \x20   ToolFailed,\n\
          \x20   Encoding,\n\
          \x20   Output,\n\
@@ -383,7 +399,7 @@ fn render_lib(spec: &ProviderSpec<'_>, naming: &Naming) -> String {
     }
     render_command(&mut out, spec, naming);
     for (tool, names) in spec.tools.iter().zip(naming.tools.iter()) {
-        render_capability(&mut out, spec, tool, names);
+        render_capability(&mut out, tool, names);
     }
     render_provider_impl(&mut out, spec, naming);
     out
@@ -487,7 +503,75 @@ fn render_helpers(out: &mut String, spec: &ProviderSpec<'_>) {
          fn init_protocol(response: &Response) -> Option<String> {\n\
          \x20   let payload = parse_rpc_body(&response.body, content_type_of(response)).ok()?;\n\
          \x20   let result = rpc_result(&payload).ok()?;\n\
-         \x20   result.get(\"protocolVersion\").and_then(Value::as_str).map(str::to_owned)\n\
+         \x20   result\n\
+         \x20       .get(\"protocolVersion\")\n\
+         \x20       .and_then(Value::as_str)\n\
+         \x20       .map(str::to_owned)\n\
+         }\n\
+         \n\
+         /// Runs one MCP round trip against `base`: `initialize`, then\n\
+         /// `tools/call` for `tool`, printing the MCP `content` as one JSON line.\n\
+         fn call_mcp(\n\
+         \x20   http: &Http,\n\
+         \x20   base: &Base,\n\
+         \x20   tool: &'static str,\n\
+         \x20   arguments: Value,\n\
+         \x20   out: &mut Stdout,\n\
+         ) -> Result<(), McpError> {\n\
+         \x20   let url = base.as_str().to_owned();\n\
+         \x20   let initialize = json!({\n\
+         \x20       \"jsonrpc\": \"2.0\",\n\
+         \x20       \"id\": 1,\n\
+         \x20       \"method\": \"initialize\",\n\
+         \x20       \"params\": {\n\
+         \x20           \"protocolVersion\": MCP_PROTOCOL_VERSION,\n\
+         \x20           \"capabilities\": {},\n\
+         \x20           \"clientInfo\": {\"name\": CLIENT_NAME, \"version\": CLIENT_VERSION},\n\
+         \x20       },\n\
+         \x20   });\n\
+         \x20   let init_request = Request::new(method::POST, &url)\n\
+         \x20       .map_err(McpError::InvalidRequest)?\n\
+         \x20       .with_header(ht(\"content-type\", \"application/json\")?)\n\
+         \x20       .with_header(ht(\"accept\", \"application/json, text/event-stream\")?)\n\
+         \x20       .with_body(initialize.to_string().into_bytes());\n\
+         \x20   let init_response = http.send(init_request).map_err(McpError::Http)?;\n\
+         \x20   if !(200..300).contains(&init_response.status) {\n\
+         \x20       return Err(McpError::HttpStatus(init_response.status));\n\
+         \x20   }\n\
+         \x20   let session = header_bytes(&init_response, \"mcp-session-id\").map(<[u8]>::to_vec);\n\
+         \x20   let protocol = init_protocol(&init_response).unwrap_or_else(|| MCP_PROTOCOL_VERSION.to_owned());\n\
+         \x20   let call = json!({\n\
+         \x20       \"jsonrpc\": \"2.0\",\n\
+         \x20       \"id\": 2,\n\
+         \x20       \"method\": \"tools/call\",\n\
+         \x20       \"params\": {\"name\": tool, \"arguments\": arguments},\n\
+         \x20   });\n\
+         \x20   let mut call_request = Request::new(method::POST, &url)\n\
+         \x20       .map_err(McpError::InvalidRequest)?\n\
+         \x20       .with_header(ht(\"content-type\", \"application/json\")?)\n\
+         \x20       .with_header(ht(\"accept\", \"application/json, text/event-stream\")?)\n\
+         \x20       .with_header(ht(\"mcp-protocol-version\", &protocol)?);\n\
+         \x20   if let Some(session) = session {\n\
+         \x20       call_request = call_request.with_header(hb(\"mcp-session-id\", session)?);\n\
+         \x20   }\n\
+         \x20   let call_request = call_request.with_body(call.to_string().into_bytes());\n\
+         \x20   let call_response = http.send(call_request).map_err(McpError::Http)?;\n\
+         \x20   if !(200..300).contains(&call_response.status) {\n\
+         \x20       return Err(McpError::HttpStatus(call_response.status));\n\
+         \x20   }\n\
+         \x20   let payload = parse_rpc_body(&call_response.body, content_type_of(&call_response))?;\n\
+         \x20   let result = rpc_result(&payload)?;\n\
+         \x20   let content = result.get(\"content\").unwrap_or(result);\n\
+         \x20   let line = serde_json::to_string(content).map_err(|_| McpError::Encoding)?;\n\
+         \x20   writeln!(out, \"{line}\").map_err(|_| McpError::Output)?;\n\
+         \x20   if result\n\
+         \x20       .get(\"isError\")\n\
+         \x20       .and_then(Value::as_bool)\n\
+         \x20       .unwrap_or(false)\n\
+         \x20   {\n\
+         \x20       return Err(McpError::ToolFailed);\n\
+         \x20   }\n\
+         \x20   Ok(())\n\
          }\n\
          \n",
     );
@@ -504,8 +588,8 @@ fn render_helpers(out: &mut String, spec: &ProviderSpec<'_>) {
              \x20           None => Ok(()),\n\
              \x20           Some(next) if tail.is_empty() => {\n\
              \x20               if let Value::String(text) = next {\n\
-             \x20                   let parsed: Value = serde_json::from_str(text)\n\
-             \x20                       .map_err(|_| McpError::InvalidArguments(*head))?;\n\
+             \x20                   let parsed: Value =\n\
+             \x20                       serde_json::from_str(text).map_err(|_| McpError::InvalidArguments(head))?;\n\
              \x20                   *next = parsed;\n\
              \x20               }\n\
              \x20               Ok(())\n\
@@ -780,8 +864,7 @@ fn render_command(out: &mut String, spec: &ProviderSpec<'_>, naming: &Naming) {
              \x20   flag: &'static str,\n\
              \x20   raw: String,\n\
              ) -> Result<T, Usage> {\n\
-             \x20   serde_json::from_str(&raw)\n\
-             \x20       .map_err(|_| Usage::new(format!(\"{tool}: --{flag} must be JSON\")))\n\
+             \x20   serde_json::from_str(&raw).map_err(|_| Usage::new(format!(\"{tool}: --{flag} must be JSON\")))\n\
              }\n\
              \n",
         );
@@ -793,17 +876,24 @@ fn flag_name(rust_name: &str) -> String {
     rust_name.trim_start_matches("r#").replace('_', "-")
 }
 
-fn render_capability(
-    out: &mut String,
-    spec: &ProviderSpec<'_>,
-    tool: &TightenedTool,
-    names: &ToolNames,
-) {
+/// Render a `const DESCRIPTION` line the way rustfmt would: rustfmt only breaks
+/// after `=` when the single line overflows 100 columns but the continuation
+/// still fits; a literal too long for any line is left alone.
+fn description_const(literal: &str) -> String {
+    let single = format!("    const DESCRIPTION: &'static str = {literal};");
+    if single.len() > 100 && literal.len() + 9 <= 100 {
+        format!("    const DESCRIPTION: &'static str =\n        {literal};")
+    } else {
+        single
+    }
+}
+
+fn render_capability(out: &mut String, tool: &TightenedTool, names: &ToolNames) {
     out.push_str(&format!(
         "impl Capability for {} {{\n\
          \x20   type Provider = McpProvider;\n\
          \x20   const NAME: &'static str = {};\n\
-         \x20   const DESCRIPTION: &'static str = {};\n\
+{}\n\
          \x20   const EFFECT: EffectKind = {};\n\
          \x20   const RISK: RiskLevel = {};\n\
          \x20   type Input = {};\n\
@@ -815,10 +905,13 @@ fn render_capability(
          \x20       (settings, http): (Settings<McpSettings>, Http),\n\
          \x20       out: &mut Stdout,\n\
          \x20   ) -> Result<(), McpError> {{\n\
-         \x20       let base = settings.into_inner().base_url.unwrap_or_else(|| VENDOR_BASE.clone());\n",
+         \x20       let base = settings\n\
+         \x20           .into_inner()\n\
+         \x20           .base_url\n\
+         \x20           .unwrap_or_else(|| VENDOR_BASE.clone());\n",
         names.cap_struct,
         lit(&tool.cap_name),
-        lit(&tool.description),
+        description_const(&lit(&tool.description)),
         tool.effect.token(),
         tool.risk.token(),
         names.input_struct,
@@ -826,8 +919,8 @@ fn render_capability(
     ));
     if tool.top_level_map {
         out.push_str(
-            "        let arguments: Value =\n\
-             \x20           serde_json::from_str(&input.payload).map_err(|_| McpError::InvalidArguments(\"payload\"))?;\n\
+            "        let arguments: Value = serde_json::from_str(&input.payload)\n\
+             \x20           .map_err(|_| McpError::InvalidArguments(\"payload\"))?;\n\
              \x20       if !arguments.is_object() {\n\
              \x20           return Err(McpError::InvalidArguments(\"payload\"));\n\
              \x20       }\n",
@@ -839,13 +932,11 @@ fn render_capability(
         }
         if paths.is_empty() {
             out.push_str(
-                "        let arguments =\n\
-                 \x20           serde_json::to_value(&input).map_err(|_| McpError::Encoding)?;\n",
+                "        let arguments = serde_json::to_value(&input).map_err(|_| McpError::Encoding)?;\n",
             );
         } else {
             out.push_str(
-                "        let mut arguments =\n\
-                 \x20           serde_json::to_value(&input).map_err(|_| McpError::Encoding)?;\n",
+                "        let mut arguments = serde_json::to_value(&input).map_err(|_| McpError::Encoding)?;\n",
             );
             for path in paths {
                 let segments: Vec<String> = path.iter().map(|s| lit(s)).collect();
@@ -857,65 +948,10 @@ fn render_capability(
         }
     }
     out.push_str(&format!(
-        "        let url = base.as_str().to_owned();\n\
-         \x20       let initialize = json!({{\n\
-         \x20           \"jsonrpc\": \"2.0\",\n\
-         \x20           \"id\": 1,\n\
-         \x20           \"method\": \"initialize\",\n\
-         \x20           \"params\": {{\n\
-         \x20               \"protocolVersion\": MCP_PROTOCOL_VERSION,\n\
-         \x20               \"capabilities\": {{}},\n\
-         \x20               \"clientInfo\": {{\"name\": {}, \"version\": {}}},\n\
-         \x20           }},\n\
-         \x20       }});\n\
-         \x20       let init_request = Request::new(method::POST, &url)\n\
-         \x20           .map_err(McpError::InvalidRequest)?\n\
-         \x20           .with_header(ht(\"content-type\", \"application/json\")?)\n\
-         \x20           .with_header(ht(\"accept\", \"application/json, text/event-stream\")?)\n\
-         \x20           .with_body(initialize.to_string().into_bytes());\n\
-         \x20       let init_response = http.send(init_request).map_err(McpError::Http)?;\n\
-         \x20       if !(200..300).contains(&init_response.status) {{\n\
-         \x20           return Err(McpError::HttpStatus(init_response.status));\n\
-         \x20       }}\n\
-         \x20       let session =\n\
-         \x20           header_bytes(&init_response, \"mcp-session-id\").map(<[u8]>::to_vec);\n\
-         \x20       let protocol =\n\
-         \x20           init_protocol(&init_response).unwrap_or_else(|| MCP_PROTOCOL_VERSION.to_owned());\n\
-         \x20       let call = json!({{\n\
-         \x20           \"jsonrpc\": \"2.0\",\n\
-         \x20           \"id\": 2,\n\
-         \x20           \"method\": \"tools/call\",\n\
-         \x20           \"params\": {{\"name\": {}, \"arguments\": arguments}},\n\
-         \x20       }});\n\
-         \x20       let mut call_request = Request::new(method::POST, &url)\n\
-         \x20           .map_err(McpError::InvalidRequest)?\n\
-         \x20           .with_header(ht(\"content-type\", \"application/json\")?)\n\
-         \x20           .with_header(ht(\"accept\", \"application/json, text/event-stream\")?)\n\
-         \x20           .with_header(ht(\"mcp-protocol-version\", &protocol)?);\n\
-         \x20       if let Some(session) = session {{\n\
-         \x20           call_request = call_request.with_header(hb(\"mcp-session-id\", session)?);\n\
-         \x20       }}\n\
-         \x20       let call_request = call_request.with_body(call.to_string().into_bytes());\n\
-         \x20       let call_response = http.send(call_request).map_err(McpError::Http)?;\n\
-         \x20       if !(200..300).contains(&call_response.status) {{\n\
-         \x20           return Err(McpError::HttpStatus(call_response.status));\n\
-         \x20       }}\n\
-         \x20       let payload = parse_rpc_body(&call_response.body, content_type_of(&call_response))?;\n\
-         \x20       let result = rpc_result(&payload)?;\n\
-         \x20       let content = result.get(\"content\").unwrap_or(result);\n\
-         \x20       let line = serde_json::to_string(content).map_err(|_| McpError::Encoding)?;\n\
-         \x20       writeln!(out, \"{{line}}\").map_err(|_| McpError::Output)?;\n\
-         \x20       if result.get(\"isError\").and_then(Value::as_bool).unwrap_or(false) {{\n\
-         \x20           return Err(McpError::ToolFailed);\n\
-         \x20       }}\n\
-         \x20       Ok(())\n\
-         \x20   }}\n\
-         }}\n\
-         \n",
-        lit(&spec.id),
-        lit(&spec.generator_version),
+        "        call_mcp(&http, &base, {}, arguments, out)\n",
         lit(&tool.mcp_name),
     ));
+    out.push_str("    }\n}\n\n");
 }
 
 fn render_provider_impl(out: &mut String, spec: &ProviderSpec<'_>, naming: &Naming) {
@@ -931,24 +967,46 @@ fn render_provider_impl(out: &mut String, spec: &ProviderSpec<'_>, naming: &Nami
         lit(&spec.id),
     ));
     out.push_str(&format!(
-        "    const DESCRIPTION: &'static str = {};\n    type Args = Command;\n",
-        lit(&format!(
+        "{}\n    type Args = Command;\n",
+        description_const(&lit(&format!(
             "MCP tools from {} ({} {})",
             spec.endpoint.origin, spec.server.name, spec.server.version
-        )),
+        ))),
     ));
-    let caps: Vec<&str> = naming
-        .tools
-        .iter()
-        .map(|names| names.cap_struct.as_str())
-        .collect();
-    if caps.len() == 1 {
-        out.push_str(&format!("    type Capabilities = ({},);\n", caps[0]));
+    // The tuple shape is ours (single line when it fits, vertical otherwise) and
+    // pinned with rustfmt::skip: rustfmt's one-line-vs-vertical rule for type
+    // aliases depends on undocumented width/item-count heuristics, so mirroring
+    // it exactly is fragile. Both shapes are covered by end-to-end fmt checks.
+    let single = if naming.tools.len() == 1 {
+        format!(
+            "    type Capabilities = ({},);\n",
+            naming.tools[0].cap_struct
+        )
     } else {
-        out.push_str(&format!("    type Capabilities = ({});\n", caps.join(", ")));
+        format!(
+            "    type Capabilities = ({});\n",
+            naming
+                .tools
+                .iter()
+                .map(|names| names.cap_struct.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    out.push_str("    #[rustfmt::skip]\n");
+    if single.len() <= 100 {
+        out.push_str(&single);
+    } else {
+        out.push_str("    type Capabilities = (\n");
+        for names in naming.tools.iter() {
+            out.push_str(&format!("        {},\n", names.cap_struct));
+        }
+        out.push_str("    );\n");
     }
+    // Pinned: match-arm overflow shapes depend on tool-name lengths and rustfmt's
+    // version-sensitive arm heuristics, so this mechanical dispatch is exempt.
     out.push_str(
-        "    fn propose(args: Command, _stdin_piped: bool) -> Result<Proposal<Self>, Usage> {\n\
+        "    #[rustfmt::skip]\n    fn propose(args: Command, _stdin_piped: bool) -> Result<Proposal<Self>, Usage> {\n\
          \x20       match args.action {\n",
     );
     for (tool, names) in spec.tools.iter().zip(naming.tools.iter()) {
@@ -998,8 +1056,13 @@ fn render_cargo(spec: &ProviderSpec<'_>, crate_name: &str) -> String {
          name = \"{crate_name}\"\n\
          version = \"0.1.0\"\n\
          edition = \"2021\"\n\
+         rust-version = \"1.98.1\"\n\
          publish = false\n\
          description = \"Dekopon provider generated from {} by mcp2dekopon {}\"\n\
+         \n\
+         # Small components; backtraces come from the broker, not the wasm.\n\
+         [profile.release]\n\
+         strip = true\n\
          \n\
          # cdylib for the component build, rlib so `cargo test` can drive the\n\
          # provider natively through the testkit.\n\
@@ -1054,6 +1117,12 @@ fn render_build_sh(spec: &ProviderSpec<'_>, crate_name: &str) -> String {
          \x20 echo \"error: wasm-tools is required (cargo install wasm-tools --locked)\" >&2\n\
          \x20 exit 3\n\
          }}\n\
+         if wasm_version=$(wasm-tools --version 2>/dev/null); then\n\
+         \x20 case \"$wasm_version\" in\n\
+         \x20   *\" 1.259.0\"*) ;;\n\
+         \x20   *) echo \"warning: $wasm_version (generated code is tested with wasm-tools 1.259.0)\" >&2 ;;\n\
+         \x20 esac\n\
+         fi\n\
          wasm-tools component new \"target/wasm32-unknown-unknown/release/{crate_name}.wasm\" -o \"{id}.wasm\"\n\
          rm -f build-target.log\n\
          echo \"wrote {id}.wasm\"\n",
@@ -1083,7 +1152,8 @@ fn sample_input(tool: &TightenedTool) -> Value {
 fn sample_value(field_type: &FieldType) -> Value {
     match field_type {
         FieldType::String => Value::String(String::new()),
-        FieldType::Integer | FieldType::Number => Value::from(0),
+        FieldType::Integer => Value::from(0),
+        FieldType::Number => Value::from(0.0),
         FieldType::Boolean => Value::Bool(false),
         FieldType::JsonString => Value::String("{}".to_string()),
         FieldType::Any => Value::Null,
@@ -1109,6 +1179,30 @@ fn sample_object(shape: &ObjectShape) -> Value {
         }
     }
     Value::Object(map)
+}
+
+/// Renders `command` argv (as Rust string literals) that proposes a tool call
+/// with sample values for every required flag.
+fn propose_argv(tool: &TightenedTool) -> Vec<String> {
+    let mut argv = vec![lit(&tool.cap_name)];
+    for field in &tool.fields {
+        if !field.required {
+            continue;
+        }
+        argv.push(lit(&format!("--{}", flag_name(&field.rust_name))));
+        match &field.field_type {
+            FieldType::Boolean => {}
+            FieldType::String => argv.push(lit("")),
+            FieldType::JsonString => argv.push(lit("{}")),
+            FieldType::Integer | FieldType::Number => argv.push(lit("0")),
+            other => {
+                let text = serde_json::to_string(&sample_value(other))
+                    .unwrap_or_else(|_| "null".to_string());
+                argv.push(lit(&text));
+            }
+        }
+    }
+    argv
 }
 
 /// Renders a value as `json!` macro tokens.
@@ -1138,9 +1232,9 @@ fn json_tokens(value: &Value) -> String {
 fn render_native_e2e(spec: &ProviderSpec<'_>, naming: &Naming, crate_name: &str) -> String {
     let mut out = format!(
         "//! End-to-end calls through the testkit fake broker against a scripted MCP origin.\n\
-         use dekopon_provider_sdk::provider::Response;\n\
+         use dekopon_provider_sdk::provider::{{Header, Response}};\n\
          use dekopon_provider_sdk_testkit::{{HttpScript, Native}};\n\
-         use serde_json::{{Value, json}};\n\
+         use serde_json::{{json, Value}};\n\
          \n\
          use {crate_name}::McpProvider;\n\
          \n\
@@ -1166,12 +1260,34 @@ fn render_native_e2e(spec: &ProviderSpec<'_>, naming: &Naming, crate_name: &str)
          \x20       }},\n\
          \x20   )\n\
          }}\n\
+         \n\
+         /// A scripted answer with full control over status, headers and body,\n\
+         /// for the error-path tests below.\n\
+         fn scripted_raw(status: u16, headers: Vec<Header>, body: &str) -> HttpScript {{\n\
+         \x20   HttpScript::new(\n\
+         \x20       ORIGIN_HOST,\n\
+         \x20       \"POST\",\n\
+         \x20       Response {{\n\
+         \x20           status,\n\
+         \x20           headers,\n\
+         \x20           body: body.as_bytes().to_vec(),\n\
+         \x20       }},\n\
+         \x20   )\n\
+         }}\n\
+         \n\
+         fn sse_content_type() -> Header {{\n\
+         \x20   Header {{\n\
+         \x20       name: \"content-type\".to_string(),\n\
+         \x20       value: b\"text/event-stream\".to_vec(),\n\
+         \x20   }}\n\
+         }}\n\
          \n"
     );
     for (tool, names) in spec.tools.iter().zip(naming.tools.iter()) {
         let sample = json_tokens(&sample_input(tool));
         out.push_str(&format!(
             "#[test]\n\
+             #[rustfmt::skip]\n\
              fn e2e_{}() {{\n\
              \x20   let native = Native::<McpProvider>::new()\n\
              \x20       .settings(json!({{\"baseUrl\": ORIGIN_BASE}}))\n\
@@ -1198,6 +1314,29 @@ fn render_native_e2e(spec: &ProviderSpec<'_>, naming: &Naming, crate_name: &str)
             id_cap_lit = lit(&format!("{}.{}", spec.id, tool.cap_name)),
             mcp_lit = lit(&tool.mcp_name),
         ));
+        let argv = propose_argv(tool).join(", ");
+        out.push_str(&format!(
+            "#[test]\n\
+             #[rustfmt::skip]\n\
+             fn propose_{}() {{\n\
+             \x20   let outcome = dekopon_provider_sdk::provider::command::<McpProvider>(\n\
+             \x20       &[{argv}].map(str::to_string),\n\
+             \x20       false,\n\
+             \x20   );\n\
+             \x20   match outcome {{\n\
+             \x20       dekopon_provider_sdk::CommandRunOutcome::Proposed {{ capability, input, .. }} => {{\n\
+             \x20           assert_eq!(capability.to_string(), {id_cap});\n\
+             \x20           assert_eq!(input, json!({sample}));\n\
+             \x20       }}\n\
+             \x20       other => panic!(\"propose {}: expected Proposed, got {{other:?}}\"),\n\
+             \x20   }}\n\
+             }}\n\
+             \n",
+            names.test_name,
+            tool.cap_name,
+            id_cap = lit(&format!("{}.{}", spec.id, tool.cap_name)),
+            sample = json_tokens(&sample_input(tool)),
+        ));
     }
     let subcommands: Vec<String> = spec.tools.iter().map(|t| lit(&t.cap_name)).collect();
     let ids: Vec<String> = spec
@@ -1205,8 +1344,21 @@ fn render_native_e2e(spec: &ProviderSpec<'_>, naming: &Naming, crate_name: &str)
         .iter()
         .map(|t| lit(&format!("{}.{}", spec.id, t.cap_name)))
         .collect();
+    let labels: Vec<String> = spec
+        .tools
+        .iter()
+        .map(|t| {
+            format!(
+                "({}.to_string(), {}.to_string(), {}.to_string())",
+                lit(&format!("{}.{}", spec.id, t.cap_name)),
+                lit(t.effect.wire()),
+                lit(t.risk.wire()),
+            )
+        })
+        .collect();
     out.push_str(&format!(
         "#[test]\n\
+         #[rustfmt::skip]\n\
          fn cli_help_renders_for_every_tool() {{\n\
          \x20   for subcommand in [{}] {{\n\
          \x20       let outcome = dekopon_provider_sdk::provider::command::<McpProvider>(\n\
@@ -1224,6 +1376,20 @@ fn render_native_e2e(spec: &ProviderSpec<'_>, naming: &Naming, crate_name: &str)
          }}\n\
          \n\
          #[test]\n\
+         #[rustfmt::skip]\n\
+         fn unknown_capability_fails() {{\n\
+         \x20   let native = Native::<McpProvider>::new();\n\
+         \x20   let output = native.call({}, \"{{}}\");\n\
+         \x20   assert_ne!(output.status, 0);\n\
+         \x20   assert!(\n\
+         \x20       output.stderr.contains(\"no such capability\"),\n\
+         \x20       \"{{}}\",\n\
+         \x20       output.stderr\n\
+         \x20   );\n\
+         }}\n\
+         \n\
+         #[test]\n\
+         #[rustfmt::skip]\n\
          fn manifest_lists_every_capability() {{\n\
          \x20   let manifest =\n\
          \x20       dekopon_provider_sdk::provider::manifest::<McpProvider>().expect(\"closed schemas\");\n\
@@ -1233,11 +1399,112 @@ fn render_native_e2e(spec: &ProviderSpec<'_>, naming: &Naming, crate_name: &str)
          \x20       .map(|capability| capability.id.to_string())\n\
          \x20       .collect();\n\
          \x20   assert_eq!(ids, vec![{}]);\n\
+         \x20   let labels: Vec<(String, String, String)> = manifest\n\
+         \x20       .capabilities\n\
+         \x20       .iter()\n\
+         \x20       .map(|capability| {{\n\
+         \x20           (\n\
+         \x20               capability.id.to_string(),\n\
+         \x20               capability.effect.to_string(),\n\
+         \x20               format!(\"{{:?}}\", capability.risk),\n\
+         \x20           )\n\
+         \x20       }})\n\
+         \x20       .collect();\n\
+         \x20   assert_eq!(labels, vec![{}]);\n\
          }}\n",
         subcommands.join(", "),
-        ids.join(", ")
+        lit(&format!("{}.no-such-tool", spec.id)),
+        ids.join(", "),
+        labels.join(", "),
     ));
+    if let Some((tool, names)) = spec.tools.iter().zip(naming.tools.iter()).next() {
+        render_error_path_tests(&mut out, spec, tool, names);
+    }
     out
+}
+
+/// Error-path tests against the first capability: SSE answers, tool-reported
+/// errors, answers without `content`, and HTTP failures.
+fn render_error_path_tests(
+    out: &mut String,
+    spec: &ProviderSpec<'_>,
+    tool: &TightenedTool,
+    names: &ToolNames,
+) {
+    let sample = json_tokens(&sample_input(tool));
+    let id_cap = lit(&format!("{}.{}", spec.id, tool.cap_name));
+    let test = names.test_name.as_str();
+    out.push_str(&format!(
+        "\n\
+         #[test]\n\
+         #[rustfmt::skip]\n\
+         fn e2e_error_{test}_sse() {{\n\
+         \x20   let answer = json!({{\n\
+         \x20       \"jsonrpc\": \"2.0\",\n\
+         \x20       \"id\": 2,\n\
+         \x20       \"result\": {{\"content\": [{{\"type\": \"text\", \"text\": \"sse-ok\"}}]}},\n\
+         \x20   }});\n\
+         \x20   let body = format!(\"event: message\\ndata: {{answer}}\\n\\n\");\n\
+         \x20   let native = Native::<McpProvider>::new()\n\
+         \x20       .settings(json!({{\"baseUrl\": ORIGIN_BASE}}))\n\
+         \x20       .http(scripted_raw(200, vec![sse_content_type()], &body));\n\
+         \x20   let output = native.call({id_cap}, &json!({sample}).to_string());\n\
+         \x20   assert_eq!(output.status, 0, \"stderr: {{}}\", output.stderr);\n\
+         \x20   let actual: Value = serde_json::from_slice(&output.stdout).expect(\"stdout is JSON\");\n\
+         \x20   assert_eq!(actual, json!([{{\"type\": \"text\", \"text\": \"sse-ok\"}}]));\n\
+         }}\n\
+         \n\
+         #[test]\n\
+         #[rustfmt::skip]\n\
+         fn e2e_error_{test}_tool_error() {{\n\
+         \x20   let body = json!({{\n\
+         \x20       \"jsonrpc\": \"2.0\",\n\
+         \x20       \"id\": 2,\n\
+         \x20       \"result\": {{\n\
+         \x20           \"content\": [{{\"type\": \"text\", \"text\": \"bad\"}}],\n\
+         \x20           \"isError\": true,\n\
+         \x20       }},\n\
+         \x20   }})\n\
+         \x20   .to_string();\n\
+         \x20   let native = Native::<McpProvider>::new()\n\
+         \x20       .settings(json!({{\"baseUrl\": ORIGIN_BASE}}))\n\
+         \x20       .http(scripted_raw(200, Vec::new(), &body));\n\
+         \x20   let output = native.call({id_cap}, &json!({sample}).to_string());\n\
+         \x20   assert_ne!(output.status, 0);\n\
+         \x20   let actual: Value = serde_json::from_slice(&output.stdout).expect(\"stdout is JSON\");\n\
+         \x20   assert_eq!(actual, json!([{{\"type\": \"text\", \"text\": \"bad\"}}]));\n\
+         }}\n\
+         \n\
+         #[test]\n\
+         #[rustfmt::skip]\n\
+         fn e2e_error_{test}_bare_result() {{\n\
+         \x20   let body = json!({{\n\
+         \x20       \"jsonrpc\": \"2.0\",\n\
+         \x20       \"id\": 2,\n\
+         \x20       \"result\": {{\"structuredContent\": {{\"answer\": 42}}}},\n\
+         \x20   }})\n\
+         \x20   .to_string();\n\
+         \x20   let native = Native::<McpProvider>::new()\n\
+         \x20       .settings(json!({{\"baseUrl\": ORIGIN_BASE}}))\n\
+         \x20       .http(scripted_raw(200, Vec::new(), &body));\n\
+         \x20   let output = native.call({id_cap}, &json!({sample}).to_string());\n\
+         \x20   assert_eq!(output.status, 0, \"stderr: {{}}\", output.stderr);\n\
+         \x20   let actual: Value = serde_json::from_slice(&output.stdout).expect(\"stdout is JSON\");\n\
+         \x20   assert_eq!(actual, json!({{\"structuredContent\": {{\"answer\": 42}}}}));\n\
+         }}\n\
+         \n\
+         #[test]\n\
+         #[rustfmt::skip]\n\
+         fn e2e_error_{test}_server_error() {{\n\
+         \x20   let native = Native::<McpProvider>::new()\n\
+         \x20       .settings(json!({{\"baseUrl\": ORIGIN_BASE}}))\n\
+         \x20       .http(scripted_raw(500, Vec::new(), \"boom\"));\n\
+         \x20   let output = native.call({id_cap}, &json!({sample}).to_string());\n\
+         \x20   assert_ne!(output.status, 0);\n\
+         \x20   assert!(output.stderr.contains(\"status 500\"), \"{{}}\", output.stderr);\n\
+         \x20   assert_eq!(native.requests().len(), 1);\n\
+         }}\n",
+    ));
 }
 
 fn render_conformance(spec: &ProviderSpec<'_>, crate_name: &str) -> String {
@@ -1246,6 +1513,7 @@ fn render_conformance(spec: &ProviderSpec<'_>, crate_name: &str) -> String {
          use {crate_name}::McpProvider;\n\
          \n\
          #[test]\n\
+         #[rustfmt::skip]\n\
          fn component_conformance() {{\n\
          \x20   let wasm = std::path::Path::new(env!(\"CARGO_MANIFEST_DIR\")).join(\"{}.wasm\");\n\
          \x20   if !wasm.exists() {{\n\
@@ -1475,7 +1743,7 @@ pub fn split_tools(id: &str, tools: &[TightenedTool]) -> Result<Vec<(String, Pat
 
 #[cfg(test)]
 mod tests {
-    use super::split_tools;
+    use super::{description_const, lit, split_tools};
     use crate::tighten::{Effect, Risk, TightenedTool};
 
     fn tool(name: &str) -> TightenedTool {
@@ -1507,5 +1775,18 @@ mod tests {
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].0, "mockmcp-1");
         assert_eq!(parts[1].0, "mockmcp-2");
+    }
+
+    #[test]
+    fn description_const_matches_rustfmt_break_rule() {
+        let short = description_const(&lit("tiny"));
+        assert!(!short.contains('\n'), "{short}");
+        // Overflows alone but fits on the continuation: rustfmt breaks after `=`.
+        let wrappable = description_const(&lit(&"x".repeat(60)));
+        assert!(wrappable.starts_with("    const DESCRIPTION: &'static str =\n        \""));
+        assert!(wrappable.lines().all(|line| line.len() <= 100));
+        // Too long for any line: rustfmt leaves the single line alone.
+        let huge = description_const(&lit(&"y".repeat(200)));
+        assert!(!huge.contains('\n'), "{huge}");
     }
 }
