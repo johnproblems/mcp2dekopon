@@ -14,7 +14,11 @@ include = [
     "src/**",
     "tests/**",
     "wit-0461/**",
-    "scripts/**",
+    # Top-level scripts only: bytecode caches the test suite creates under
+    # scripts/__pycache__/ must never ship (exclude is ignored when
+    # include is present, so this cannot be a scripts/** + exclude pair).
+    "scripts/*.py",
+    "scripts/*.sh",
     ".github/**",
     "docs/**",
     "README.md",
