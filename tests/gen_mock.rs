@@ -40,8 +40,22 @@ enum Mode {
     Standard,
     /// First initialize answers 500, first tools/list answers 404.
     Flaky,
-    /// Every page carries another cursor.
+    /// Every page carries a fresh cursor, so pagination never ends.
     Infinite,
+    /// Every page repeats the same cursor: a pagination loop.
+    RepeatCursor,
+    /// First tools/list answers 429 with `retry-after: 0`, then recovers.
+    RateLimited,
+    /// Every tools/list answers 429 with `retry-after: 0`.
+    Persistent429,
+    /// First tools/list answers 409 (session conflict), then recovers.
+    Conflict409,
+    /// tools/list answers with a body over the ingest cap.
+    BigBody,
+    /// tools/list answers with an empty tool name.
+    EmptyName,
+    /// initialize answers 404 (wrong endpoint path).
+    NotFound,
     /// First page ends with an empty cursor.
     EmptyCursor,
     /// Initialize answers with the wrong JSON-RPC id.
@@ -180,6 +194,12 @@ fn check_protocol(request: &HttpRequest, method: &str, problems: &Arc<Mutex<Vec<
     {
         fail(format!("{method}: missing SSE accept"));
     }
+    if !header("user-agent")
+        .unwrap_or_default()
+        .starts_with("mcp2dekopon/")
+    {
+        fail(format!("{method}: missing user-agent"));
+    }
     if method != "initialize" {
         if header("mcp-session-id").as_deref() != Some("mock-session-1") {
             fail(format!("{method}: missing session echo"));
@@ -203,6 +223,14 @@ fn route(
         "initialize" => {
             let mut counts = counts.lock().unwrap();
             counts.init += 1;
+            if mode == Mode::NotFound {
+                return (
+                    404,
+                    "application/json".to_string(),
+                    vec![],
+                    "no such path".to_string(),
+                );
+            }
             if mode == Mode::Flaky && counts.init == 1 {
                 return (
                     500,
@@ -253,7 +281,57 @@ fn route(
                     "denied".to_string(),
                 );
             }
+            if mode == Mode::Persistent429 || (mode == Mode::RateLimited && counts.list == 1) {
+                return (
+                    429,
+                    "application/json".to_string(),
+                    vec![("retry-after".to_string(), "0".to_string())],
+                    "slow down".to_string(),
+                );
+            }
+            if mode == Mode::Conflict409 && counts.list == 1 {
+                return (
+                    409,
+                    "application/json".to_string(),
+                    vec![],
+                    "session conflict".to_string(),
+                );
+            }
+            if mode == Mode::BigBody {
+                let padding = "x".repeat(17_000_000);
+                return (
+                    200,
+                    "application/json".to_string(),
+                    vec![],
+                    envelope(json!({"tools": [{
+                        "name": "big",
+                        "description": padding,
+                        "inputSchema": {"type": "object"},
+                    }]})),
+                );
+            }
+            if mode == Mode::EmptyName {
+                return (
+                    200,
+                    "application/json".to_string(),
+                    vec![],
+                    envelope(json!({"tools": [{
+                        "name": "",
+                        "inputSchema": {"type": "object"},
+                    }]})),
+                );
+            }
             if mode == Mode::Infinite {
+                // A fresh cursor every page: pagination genuinely never ends.
+                let cursor = format!("page-{}", counts.list);
+                return (
+                    200,
+                    "application/json".to_string(),
+                    vec![],
+                    envelope(json!({"tools": [], "nextCursor": cursor})),
+                );
+            }
+            if mode == Mode::RepeatCursor {
                 return (
                     200,
                     "application/json".to_string(),
@@ -568,14 +646,34 @@ fn gen_from_mock_writes_a_provider_and_a_report() {
         "{details}"
     );
 
+    // Report metadata: schema version, elapsed time, run options, and the
+    // out-joined provider directory.
+    assert_eq!(report["format_version"], 1);
+    assert!(report["elapsed_ms"].as_u64().is_some(), "{report}");
+    assert_eq!(report["options"]["offered_protocol_version"], "2025-06-18");
+    assert_eq!(report["options"]["timeout_secs"], 30);
+    assert_eq!(report["options"]["max_attempts"], 3);
+    assert_eq!(report["options"]["max_tools"], 1000);
+    assert_eq!(
+        report["providers"][0]["dir"],
+        Value::String(provider.display().to_string())
+    );
+
     let lib = std::fs::read_to_string(provider.join("src/lib.rs")).unwrap();
     assert!(lib.contains("dekopon_provider_sdk::export!(McpProvider);"));
     assert!(lib.contains("const NAME: &'static str = \"search\";"));
     assert!(lib.contains("parse_json_field_path(&mut arguments, &[\"options\", \"labels\"])?;"));
+    assert!(
+        lib.contains("notifications/initialized"),
+        "notice leg missing"
+    );
+    assert!(lib.contains("did not match request 2"), "id check missing");
 
     let broker = std::fs::read_to_string(provider.join("broker.d/mockmcp.yaml")).unwrap();
     assert!(broker.contains(&format!("allowedHosts: [127.0.0.1:{}]", mock.port)));
     assert!(broker.contains("allowPlaintextLoopback: true"));
+    assert!(broker.contains("maxRequests: 3"), "{broker}");
+    assert!(broker.contains("timeoutMs: 30000"), "{broker}");
 
     // The mock saw the full lifecycle, paginated, with session discipline.
     let (calls, problems) = mock.check();
@@ -935,9 +1033,12 @@ fn replayed_report_matches_the_live_report() {
     let mut replayed_report: Value =
         serde_json::from_str(&std::fs::read_to_string(replayed.join("report.json")).unwrap())
             .unwrap();
-    // Only the wall-clock stamp and the output directories may differ.
-    live_report["generated_at"] = Value::Null;
-    replayed_report["generated_at"] = Value::Null;
+    // Only the wall-clock stamp, the elapsed time, and the output
+    // directories may differ.
+    for key in ["generated_at", "elapsed_ms"] {
+        live_report[key] = Value::Null;
+        replayed_report[key] = Value::Null;
+    }
     for report in [&mut live_report, &mut replayed_report] {
         for provider in report["providers"].as_array_mut().unwrap() {
             provider["dir"] = Value::Null;
@@ -1035,7 +1136,13 @@ fn mock_script_usage_errors() {
     assert!(help.status.success());
     assert!(String::from_utf8_lossy(&help.stdout).contains("Usage:"));
 
-    for args in [&["--bogus"][..], &["--extra"][..], &["1", "2"][..]] {
+    for args in [
+        &["--bogus"][..],
+        &["--extra"][..],
+        &["--extra", "-1"][..],
+        &["99999"][..],
+        &["1", "2"][..],
+    ] {
         let output = std::process::Command::new("python3")
             .arg(&script)
             .args(args)
@@ -1257,5 +1364,583 @@ fn gen_rejects_bad_identity_and_endpoints() {
             .unwrap();
         assert!(!output.status.success(), "{url} {id}");
     }
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn pagination_loop_fails_fast() {
+    let mock = Mock::start_with(Mode::RepeatCursor);
+    let out = temp_dir("loop");
+    let output = run_gen(&mock.url, &out);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("repeated cursor"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (calls, _) = mock.check();
+    assert_eq!(
+        calls.iter().filter(|c| c.as_str() == "tools/list").count(),
+        2,
+        "{calls:?}"
+    );
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn fetch_honors_retry_after_then_succeeds() {
+    let mock = Mock::start_with(Mode::RateLimited);
+    let out = temp_dir("ratelimited");
+    let output = run_gen(&mock.url, &out);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("report.json")).unwrap()).unwrap();
+    assert_eq!(
+        report["providers"][0]["capabilities"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+    let (calls, problems) = mock.check();
+    assert!(
+        calls.iter().filter(|c| c.as_str() == "tools/list").count() >= 2,
+        "{calls:?}"
+    );
+    assert!(problems.is_empty(), "{problems:?}");
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn persistent_rate_limit_errors() {
+    let mock = Mock::start_with(Mode::Persistent429);
+    let out = temp_dir("always429");
+    let output = run_gen(&mock.url, &out);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("rate limiting"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn fetch_reinitializes_on_conflict() {
+    let mock = Mock::start_with(Mode::Conflict409);
+    let out = temp_dir("conflict");
+    let output = run_gen(&mock.url, &out);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (calls, problems) = mock.check();
+    assert!(
+        calls.iter().filter(|c| c.as_str() == "initialize").count() >= 2,
+        "{calls:?}"
+    );
+    assert!(problems.is_empty(), "{problems:?}");
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn oversized_body_is_refused() {
+    let mock = Mock::start_with(Mode::BigBody);
+    let out = temp_dir("bigbody");
+    let output = run_gen(&mock.url, &out);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("exceeds 16777216 bytes"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn empty_tool_name_errors() {
+    let mock = Mock::start_with(Mode::EmptyName);
+    let out = temp_dir("emptyname");
+    let output = run_gen(&mock.url, &out);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("empty name"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn initialize_404_hints_at_the_path() {
+    let mock = Mock::start_with(Mode::NotFound);
+    let out = temp_dir("notfound");
+    let output = run_gen(&mock.url, &out);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("check the --url path"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn retries_flag_disables_recovery() {
+    let mock = Mock::start_with(Mode::Flaky);
+    let out = temp_dir("noretry");
+    let output = std::process::Command::new(gen_binary())
+        .args([
+            "gen",
+            "--url",
+            &mock.url,
+            "--id",
+            "mockmcp",
+            "--out",
+            out.to_str().unwrap(),
+            "--retries",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("status 500"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn max_tools_flag_caps_and_raises() {
+    let mock = Mock::start();
+    let out = temp_dir("captools");
+    let output = std::process::Command::new(gen_binary())
+        .args([
+            "gen",
+            "--url",
+            &mock.url,
+            "--id",
+            "mockmcp",
+            "--out",
+            out.to_str().unwrap(),
+            "--max-tools",
+            "2",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("raise --max-tools"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&out);
+
+    // ... while raising the cap accepts the 1001-tool server, split into
+    // 32 providers.
+    let many = Mock::start_with(Mode::ManyTools);
+    let raised = temp_dir("raisetools");
+    let output = std::process::Command::new(gen_binary())
+        .args([
+            "gen",
+            "--url",
+            &many.url,
+            "--id",
+            "mockmcp",
+            "--out",
+            raised.to_str().unwrap(),
+            "--max-tools",
+            "2000",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value =
+        serde_json::from_str(&std::fs::read_to_string(raised.join("report.json")).unwrap())
+            .unwrap();
+    assert_eq!(report["summary"]["generated"], 1001);
+    assert_eq!(report["summary"]["providers"], 32);
+    assert!(raised.join("mockmcp-1").is_dir());
+    assert!(raised.join("mockmcp-32").is_dir());
+    let _ = std::fs::remove_dir_all(&raised);
+}
+
+#[test]
+fn save_and_dry_run_conflict() {
+    let output = std::process::Command::new(gen_binary())
+        .args([
+            "gen",
+            "--url",
+            "http://127.0.0.1:1/mcp",
+            "--id",
+            "mockmcp",
+            "--out",
+            "out",
+            "--save-tools",
+            "a.json",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn from_file_skips_the_version_warning() {
+    let mock = Mock::start();
+    let dir = temp_dir("replaynowarn");
+    std::fs::create_dir_all(&dir).unwrap();
+    let saved = dir.join("tools.json");
+    assert!(std::process::Command::new(gen_binary())
+        .args([
+            "gen",
+            "--url",
+            &mock.url,
+            "--id",
+            "mockmcp",
+            "--out",
+            dir.join("unused").to_str().unwrap(),
+            "--save-tools",
+            saved.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap()
+        .success());
+    // Nothing is negotiated from a capture, so offering a version the
+    // capture does not hold must not warn.
+    let output = std::process::Command::new(gen_binary())
+        .args([
+            "gen",
+            "--url",
+            &mock.url,
+            "--id",
+            "mockmcp",
+            "--out",
+            dir.join("replayed").to_str().unwrap(),
+            "--from-file",
+            saved.to_str().unwrap(),
+            "--protocol-version",
+            "1999-12-31",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("server speaks"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bad_id_suggests_an_alternative() {
+    let output = std::process::Command::new(gen_binary())
+        .args([
+            "gen",
+            "--url",
+            "http://127.0.0.1:1/mcp",
+            "--id",
+            "BadId",
+            "--out",
+            "out",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("did you mean \"badid\""),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn empty_protocol_version_errors() {
+    let output = std::process::Command::new(gen_binary())
+        .args([
+            "gen",
+            "--url",
+            "http://127.0.0.1:1/mcp",
+            "--id",
+            "mockmcp",
+            "--out",
+            "out",
+            "--protocol-version",
+            "",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--protocol-version must not be empty"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn zero_retries_and_max_tools_error() {
+    for flag in ["--retries", "--max-tools"] {
+        let output = std::process::Command::new(gen_binary())
+            .args([
+                "gen",
+                "--url",
+                "http://127.0.0.1:1/mcp",
+                "--id",
+                "mockmcp",
+                "--out",
+                "out",
+                flag,
+                "0",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{flag}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(flag),
+            "{flag}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn header_flag_rejects_reserved_and_malformed() {
+    for (header, trimmed) in [
+        ("content-type: application/xml", "is reserved"),
+        ("MCP-Session-Id: abc", "is reserved"),
+        ("no-colon-here", "invalid --header"),
+        ("has space: x", "invalid --header"),
+    ] {
+        let output = std::process::Command::new(gen_binary())
+            .args([
+                "gen",
+                "--url",
+                "http://127.0.0.1:1/mcp",
+                "--id",
+                "mockmcp",
+                "--out",
+                "out",
+                "--header",
+                header,
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{header}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(trimmed),
+            "{header}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn plaintext_origin_warns_on_stderr() {
+    let out = temp_dir("plaintextwarn");
+    let output = std::process::Command::new(gen_binary())
+        .args([
+            "gen",
+            "--url",
+            "http://example.test/mcp",
+            "--id",
+            "mockmcp",
+            "--out",
+            out.to_str().unwrap(),
+            "--timeout-secs",
+            "2",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("plaintext HTTP outside loopback"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn options_and_timeout_flow_into_report_and_broker() {
+    let mock = Mock::start();
+    let out = temp_dir("optionsflow");
+    let output = std::process::Command::new(gen_binary())
+        .args([
+            "gen",
+            "--url",
+            &mock.url,
+            "--id",
+            "mockmcp",
+            "--out",
+            out.to_str().unwrap(),
+            "--timeout-secs",
+            "7",
+            "--retries",
+            "2",
+            "--max-tools",
+            "50",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("report.json")).unwrap()).unwrap();
+    assert_eq!(report["options"]["timeout_secs"], 7);
+    assert_eq!(report["options"]["max_attempts"], 2);
+    assert_eq!(report["options"]["max_tools"], 50);
+    let broker = std::fs::read_to_string(out.join("mockmcp/broker.d/mockmcp.yaml")).unwrap();
+    assert!(broker.contains("timeoutMs: 7000"), "{broker}");
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn from_file_covers_pipes_plaintext_and_truncation() {
+    let dir = temp_dir("fromfileodd");
+    std::fs::create_dir_all(&dir).unwrap();
+    let capture = json!({
+        "formatVersion": 1,
+        "server": {"name": "odd-mcp", "version": "1.0", "protocolVersion": "2025-06-18"},
+        "tools": [
+            {
+                "name": "a|b",
+                "description": "Piped name.",
+                "inputSchema": {"type": "object", "properties": {"q": {"type": "string"}}},
+            },
+            {
+                "name": "recurse",
+                "description": "x".repeat(2000),
+                "inputSchema": {
+                    "type": "object",
+                    "$defs": {"Node": {"type": "object", "properties": {"child": {"$ref": "#/$defs/Node"}}}},
+                    "properties": {"node": {"$ref": "#/$defs/Node"}},
+                },
+            },
+        ],
+    });
+    let saved = dir.join("tools.json");
+    std::fs::write(&saved, serde_json::to_string_pretty(&capture).unwrap()).unwrap();
+    // Plaintext beyond loopback, but nothing is fetched from a capture.
+    let out = dir.join("out");
+    let output = std::process::Command::new(gen_binary())
+        .args([
+            "gen",
+            "--url",
+            "http://example.test/mcp",
+            "--id",
+            "mockmcp",
+            "--out",
+            out.to_str().unwrap(),
+            "--from-file",
+            saved.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let readme = std::fs::read_to_string(out.join("mockmcp/README.md")).unwrap();
+    assert!(readme.contains("`a\\|b`"), "{readme}");
+    assert!(readme.contains("## Security note"), "{readme}");
+    let report: Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("report.json")).unwrap()).unwrap();
+    assert_eq!(report["server"]["url"], "http://example.test/mcp");
+    let skipped = report["skipped"].as_array().unwrap();
+    assert_eq!(skipped.len(), 1);
+    let description = skipped[0]["description"].as_str().unwrap();
+    assert!(description.ends_with("..."), "{description}");
+    assert_eq!(description.chars().count(), 1003, "{}", description.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn oversized_capture_is_refused() {
+    let dir = temp_dir("bigcapture");
+    std::fs::create_dir_all(&dir).unwrap();
+    let saved = dir.join("tools.json");
+    let padding = "x".repeat(17_000_000);
+    std::fs::write(
+        &saved,
+        format!(
+            "{{\"formatVersion\": 1, \"server\": {{\"name\": \"n\", \"version\": \"v\", \"protocolVersion\": \"p\"}}, \"tools\": [], \"padding\": \"{padding}\"}}"
+        ),
+    )
+    .unwrap();
+    let output = std::process::Command::new(gen_binary())
+        .args([
+            "gen",
+            "--url",
+            "http://127.0.0.1:1/mcp",
+            "--id",
+            "mockmcp",
+            "--out",
+            dir.join("out").to_str().unwrap(),
+            "--from-file",
+            saved.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("exceeds 16777216 bytes"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn force_replaces_the_directory_entirely() {
+    let mock = Mock::start();
+    let out = temp_dir("forcereplace");
+    let args = [
+        "gen".to_string(),
+        "--url".to_string(),
+        mock.url.clone(),
+        "--id".to_string(),
+        "mockmcp".to_string(),
+        "--out".to_string(),
+        out.to_str().unwrap().to_string(),
+    ];
+    assert!(std::process::Command::new(gen_binary())
+        .args(&args)
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(out.join("mockmcp/notes.txt"), "operator notes").unwrap();
+    assert!(std::process::Command::new(gen_binary())
+        .args(args.iter().chain(["--force".to_string()].iter()))
+        .status()
+        .unwrap()
+        .success());
+    assert!(!out.join("mockmcp/notes.txt").exists());
+    assert!(out.join("mockmcp/src/lib.rs").is_file());
+    // No staging leftovers survive a successful run.
+    let stray: Vec<_> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.contains(".tmp-"))
+        .collect();
+    assert!(stray.is_empty(), "{stray:?}");
     let _ = std::fs::remove_dir_all(&out);
 }

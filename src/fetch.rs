@@ -5,6 +5,7 @@
 
 use reqwest::blocking::{Client, Response};
 use serde_json::{json, Value};
+use std::io::Read;
 
 use crate::rpc::{self, RpcError};
 
@@ -52,13 +53,19 @@ impl SavedTools {
         };
         let text = serde_json::to_string_pretty(&saved)
             .map_err(|e| format!("cannot encode tool list: {e}"))?;
-        std::fs::write(path, format!("{text}\n"))
-            .map_err(|e| format!("cannot write {}: {e}", path.display()))
+        crate::codegen::write_file_atomic(path, format!("{text}\n"))
     }
 
     pub fn load(path: &std::path::Path) -> Result<(ServerInfo, Vec<McpTool>), String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        if text.len() > MAX_BODY_BYTES {
+            return Err(format!(
+                "cannot parse {}: the capture exceeds {} bytes",
+                path.display(),
+                MAX_BODY_BYTES
+            ));
+        }
         let saved: Self = serde_json::from_str(&text)
             .map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
         if saved.format_version != 1 {
@@ -90,6 +97,14 @@ impl std::fmt::Display for FetchError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Transport(message) => write!(formatter, "request failed: {message}"),
+            Self::Status(429) => write!(
+                formatter,
+                "server is rate limiting (status 429); retry later or slow down"
+            ),
+            Self::Status(404) => write!(
+                formatter,
+                "server returned status 404; check the --url path"
+            ),
             Self::Status(status) => write!(formatter, "server returned status {status}"),
             Self::Unauthorized(status) => write!(
                 formatter,
@@ -104,8 +119,14 @@ impl std::fmt::Display for FetchError {
 impl std::error::Error for FetchError {}
 
 const MAX_PAGES: usize = 100;
-const MAX_TOOLS: usize = 1000;
-const MAX_ATTEMPTS: u32 = 3;
+/// Default cap on listed tools; overridable with `--max-tools`.
+pub const DEFAULT_MAX_TOOLS: usize = 1000;
+/// Default fetch attempts per request; overridable with `--retries`.
+pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
+/// Largest response body or `--from-file` capture accepted (16 MiB).
+pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// Longest `Retry-After` wait honored (30 s); larger values are clamped.
+const MAX_RETRY_AFTER_MS: u64 = 30_000;
 
 /// Validated `--url`: the vendor base, its origin and the broker scope entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -146,6 +167,8 @@ pub fn validate_endpoint(raw: &str) -> Result<Endpoint, String> {
     }
     let default_port = if url.scheme() == "https" { 443 } else { 80 };
     let port = url.port().unwrap_or(default_port);
+    // `host_str` keeps IPv6 brackets (`[::1]`), so the origin and the broker
+    // scope stay valid URIs without further wrapping.
     let host_scope = if url.scheme() == "https" && port == 443 {
         host.to_string()
     } else {
@@ -153,9 +176,7 @@ pub fn validate_endpoint(raw: &str) -> Result<Endpoint, String> {
     };
     let origin = format!("{}://{host_scope}", url.scheme());
     let vendor_base = raw.trim_end_matches('/').to_string();
-    let loopback = matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
-        || host.starts_with("127.")
-        || host == "[::1]";
+    let loopback = matches!(host, "localhost" | "127.0.0.1" | "[::1]") || host.starts_with("127.");
     let plaintext = url.scheme() == "http";
     let plaintext_note = if plaintext && !loopback {
         Some(
@@ -175,31 +196,38 @@ pub fn validate_endpoint(raw: &str) -> Result<Endpoint, String> {
     })
 }
 
+/// Options for [`fetch_tools`]: endpoint, credentials, timeouts, and caps.
+pub struct FetchOptions<'a> {
+    pub endpoint: &'a str,
+    pub extra_headers: &'a [(String, String)],
+    pub timeout_secs: u64,
+    pub protocol_version: &'a str,
+    pub client_name: &'a str,
+    pub client_version: &'a str,
+    pub verbose: bool,
+    pub max_attempts: u32,
+    pub max_tools: usize,
+}
+
 /// Fetches every tool the server lists: `initialize`, the
 /// `notifications/initialized` notice (best effort), then `tools/list`
 /// following `nextCursor`. Transient failures are retried; an expired session
-/// (400/404) re-initializes once per page.
-pub fn fetch_tools(
-    endpoint: &str,
-    extra_headers: &[(String, String)],
-    timeout_secs: u64,
-    protocol_version: &str,
-    client_name: &str,
-    client_version: &str,
-    verbose: bool,
-) -> Result<(ServerInfo, Vec<McpTool>), FetchError> {
+/// (400/404/409) re-initializes once per page.
+pub fn fetch_tools(options: &FetchOptions<'_>) -> Result<(ServerInfo, Vec<McpTool>), FetchError> {
     let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout_secs.max(1)))
+        .timeout(std::time::Duration::from_secs(options.timeout_secs.max(1)))
         .build()
         .map_err(|e| FetchError::Transport(trim_error(e.to_string())))?;
     let session = FetchSession {
         client: &client,
-        endpoint,
-        extra_headers,
-        offered: protocol_version,
-        client_name,
-        client_version,
-        verbose,
+        endpoint: options.endpoint,
+        extra_headers: options.extra_headers,
+        offered: options.protocol_version,
+        client_name: options.client_name,
+        client_version: options.client_version,
+        verbose: options.verbose,
+        max_attempts: options.max_attempts.max(1),
+        max_tools: options.max_tools.max(1),
         next_id: std::cell::Cell::new(0_u64),
     };
 
@@ -214,6 +242,7 @@ pub fn fetch_tools(
 
     let mut tools = Vec::new();
     let mut cursor: Option<String> = None;
+    let mut seen_cursors = std::collections::HashSet::new();
     for _ in 0..MAX_PAGES {
         let mut params = serde_json::Map::new();
         if let Some(next) = &cursor {
@@ -227,7 +256,7 @@ pub fn fetch_tools(
             "params": params,
         });
         let response = match session.post(session_id.as_deref(), Some(&negotiated), &list) {
-            Err(FetchError::Status(400 | 404)) => {
+            Err(FetchError::Status(400 | 404 | 409)) => {
                 session.log("session rejected; re-initializing once");
                 (_, session_id, negotiated) = session.initialize()?;
                 session.post(session_id.as_deref(), Some(&negotiated), &list)?
@@ -243,9 +272,10 @@ pub fn fetch_tools(
             .ok_or_else(|| FetchError::Body("tools/list result had no tools array".to_string()))?;
         for tool in listed {
             tools.push(parse_tool(tool)?);
-            if tools.len() > MAX_TOOLS {
+            if tools.len() > session.max_tools {
                 return Err(FetchError::Body(format!(
-                    "server listed more than {MAX_TOOLS} tools"
+                    "server listed more than {} tools; raise --max-tools to accept more",
+                    session.max_tools
                 )));
             }
         }
@@ -254,8 +284,14 @@ pub fn fetch_tools(
             .and_then(Value::as_str)
             .filter(|next| !next.is_empty())
             .map(str::to_owned);
-        if cursor.is_none() {
-            break;
+        match &cursor {
+            None => break,
+            Some(next) if !seen_cursors.insert(next.clone()) => {
+                return Err(FetchError::Body(format!(
+                    "tools/list pagination repeated cursor {next:?}; the server is looping"
+                )));
+            }
+            Some(_) => {}
         }
     }
     if cursor.is_some() {
@@ -274,7 +310,17 @@ struct FetchSession<'a> {
     client_name: &'a str,
     client_version: &'a str,
     verbose: bool,
+    max_attempts: u32,
+    max_tools: usize,
     next_id: std::cell::Cell<u64>,
+}
+
+/// One failed POST attempt: the error, whether retrying may help, and how
+/// long the server asked us to wait (`Retry-After`).
+struct AttemptFailure {
+    error: FetchError,
+    retryable: bool,
+    retry_after_ms: Option<u64>,
 }
 
 impl FetchSession<'_> {
@@ -336,6 +382,7 @@ impl FetchSession<'_> {
         protocol_version: Option<&str>,
         body: &Value,
     ) -> Result<Response, FetchError> {
+        let user_agent = format!("{}/{}", self.client_name, self.client_version);
         let mut attempt = 0_u32;
         loop {
             attempt += 1;
@@ -345,14 +392,19 @@ impl FetchSession<'_> {
                 self.extra_headers,
                 session,
                 protocol_version,
+                &user_agent,
                 body,
             ) {
                 Ok(response) => return Ok(response),
-                Err((error, retryable)) if retryable && attempt < MAX_ATTEMPTS => {
-                    self.log(&format!("attempt {attempt} failed ({error}); retrying"));
-                    std::thread::sleep(std::time::Duration::from_millis(200 * u64::from(attempt)));
+                Err(failure) if failure.retryable && attempt < self.max_attempts => {
+                    self.log(&format!(
+                        "attempt {attempt} failed ({}); retrying",
+                        failure.error
+                    ));
+                    let wait = failure.retry_after_ms.unwrap_or(200 * u64::from(attempt));
+                    std::thread::sleep(std::time::Duration::from_millis(wait));
                 }
-                Err((error, _)) => return Err(error),
+                Err(failure) => return Err(failure.error),
             }
         }
     }
@@ -369,8 +421,11 @@ fn check_id(payload: &Value, expected: u64) -> Result<(), FetchError> {
     if matches {
         Ok(())
     } else {
+        let got = payload
+            .get("id")
+            .map_or_else(|| "missing".to_string(), Value::to_string);
         Err(FetchError::Body(format!(
-            "response id did not match request {expected}"
+            "response id {got} did not match request {expected}"
         )))
     }
 }
@@ -381,6 +436,11 @@ fn parse_tool(tool: &Value) -> Result<McpTool, FetchError> {
         .and_then(Value::as_str)
         .ok_or_else(|| FetchError::Body("a listed tool had no name".to_string()))?
         .to_owned();
+    if name.trim().is_empty() {
+        return Err(FetchError::Body(
+            "a listed tool had an empty name".to_string(),
+        ));
+    }
     let annotations = tool.get("annotations");
     Ok(McpTool {
         name,
@@ -399,19 +459,27 @@ fn parse_tool(tool: &Value) -> Result<McpTool, FetchError> {
     })
 }
 
-/// One POST attempt. The flag says whether the failure is worth retrying.
+/// One POST attempt. The failure says whether retrying may help and how
+/// long the server asked us to wait.
 fn post_once(
     client: &Client,
     endpoint: &str,
     extra_headers: &[(String, String)],
     session: Option<&str>,
     protocol_version: Option<&str>,
+    user_agent: &str,
     body: &Value,
-) -> Result<Response, (FetchError, bool)> {
+) -> Result<Response, AttemptFailure> {
+    let fail = |error: FetchError, retryable: bool| AttemptFailure {
+        error,
+        retryable,
+        retry_after_ms: None,
+    };
     let mut request = client
         .post(endpoint)
         .header("content-type", "application/json")
-        .header("accept", "application/json, text/event-stream");
+        .header("accept", "application/json, text/event-stream")
+        .header("user-agent", user_agent);
     for (name, value) in extra_headers {
         request = request.header(name.as_str(), value.as_str());
     }
@@ -425,7 +493,7 @@ fn post_once(
         Ok(response) => response,
         Err(error) => {
             let retryable = error.is_timeout() || error.is_connect();
-            return Err((
+            return Err(fail(
                 FetchError::Transport(trim_error(error.to_string())),
                 retryable,
             ));
@@ -436,10 +504,28 @@ fn post_once(
         return Ok(response);
     }
     if matches!(status, 401 | 403 | 407) {
-        return Err((FetchError::Unauthorized(status), false));
+        return Err(fail(FetchError::Unauthorized(status), false));
+    }
+    if status == 429 {
+        return Err(AttemptFailure {
+            error: FetchError::Status(status),
+            retryable: true,
+            retry_after_ms: retry_after_ms(&response),
+        });
     }
     let retryable = matches!(status, 500 | 502 | 503 | 504);
-    Err((FetchError::Status(status), retryable))
+    Err(fail(FetchError::Status(status), retryable))
+}
+
+/// Reads `Retry-After` (delay seconds) from a 429 answer, clamped so a wild
+/// server cannot park the CLI for long. HTTP-date forms are not honored.
+fn retry_after_ms(response: &Response) -> Option<u64> {
+    let seconds: u64 = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse().ok())?;
+    Some(seconds.saturating_mul(1000).min(MAX_RETRY_AFTER_MS))
 }
 
 fn rpc_body(response: Response) -> Result<Value, FetchError> {
@@ -448,9 +534,18 @@ fn rpc_body(response: Response) -> Result<Value, FetchError> {
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let bytes = response
-        .bytes()
+    // `take` bounds memory even when the server omits content-length or
+    // lies about it; one byte over the cap is enough to refuse.
+    let mut bytes = Vec::new();
+    response
+        .take((MAX_BODY_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
         .map_err(|e| FetchError::Transport(trim_error(e.to_string())))?;
+    if bytes.len() > MAX_BODY_BYTES {
+        return Err(FetchError::Body(format!(
+            "response body exceeds {MAX_BODY_BYTES} bytes"
+        )));
+    }
     rpc::parse_rpc_body(&bytes, content_type.as_deref()).map_err(FetchError::Body)
 }
 
@@ -484,6 +579,27 @@ mod tests {
     }
 
     #[test]
+    fn id_mismatch_names_the_received_id() {
+        let wrong = check_id(&json!({"id": 999}), 3).unwrap_err().to_string();
+        assert!(wrong.contains("999"), "{wrong}");
+        assert!(wrong.contains('3'), "{wrong}");
+        let missing = check_id(&json!({}), 0).unwrap_err().to_string();
+        assert!(missing.contains("missing"), "{missing}");
+    }
+
+    #[test]
+    fn blank_tool_names_reject_at_parse() {
+        for name in [Value::Null, json!(""), json!("   ")] {
+            let tool = json!({"name": name, "inputSchema": {"type": "object"}});
+            assert!(parse_tool(&tool).is_err(), "{tool}");
+        }
+        let missing = json!({"inputSchema": {"type": "object"}});
+        assert!(parse_tool(&missing).is_err());
+        let named = json!({"name": "ok", "inputSchema": {"type": "object"}});
+        assert!(parse_tool(&named).is_ok());
+    }
+
+    #[test]
     fn endpoints_validate_like_base() {
         let https = validate_endpoint("https://mcp.deepwiki.com/mcp/").unwrap();
         assert_eq!(https.vendor_base, "https://mcp.deepwiki.com/mcp");
@@ -507,5 +623,22 @@ mod tests {
         assert!(validate_endpoint("https://x.test/mcp#top").is_err());
         assert!(validate_endpoint("https://x.test/m cp").is_err());
         assert!(validate_endpoint("not a url").is_err());
+    }
+
+    #[test]
+    fn ipv6_origins_keep_their_brackets() {
+        let v6 = validate_endpoint("http://[::1]:8787/mcp").unwrap();
+        assert_eq!(v6.origin, "http://[::1]:8787");
+        assert_eq!(v6.host_scope, "[::1]:8787");
+        assert!(v6.plaintext_loopback);
+        assert!(v6.plaintext_note.is_none());
+
+        let tls = validate_endpoint("https://[2001:db8::1]/mcp").unwrap();
+        assert_eq!(tls.origin, "https://[2001:db8::1]");
+        assert_eq!(tls.host_scope, "[2001:db8::1]");
+        assert!(!tls.plaintext_loopback);
+
+        let tls_port = validate_endpoint("https://[2001:db8::1]:8443/mcp").unwrap();
+        assert_eq!(tls_port.host_scope, "[2001:db8::1]:8443");
     }
 }

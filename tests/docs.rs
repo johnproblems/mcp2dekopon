@@ -92,6 +92,28 @@ fn version_flag_reports_crate_version() {
     );
 }
 
+/// The demo media committed under docs/demos/ exists, has valid container
+/// magic, and is large enough to hold real footage. Deep checks (duration,
+/// animation, non-blank frames) live in scripts/record-demos.py --verify-only.
+#[test]
+fn demos_exist_and_are_valid_media() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/demos");
+    for name in ["generate", "offline", "review"] {
+        let gif = std::fs::read(root.join(format!("{name}.gif"))).unwrap();
+        assert!(
+            gif.starts_with(b"GIF89a") && gif.len() > 20_000,
+            "{name}.gif is {} bytes",
+            gif.len()
+        );
+        let mp4 = std::fs::read(root.join(format!("{name}.mp4"))).unwrap();
+        assert!(
+            mp4.len() > 20_000 && mp4[4..8] == *b"ftyp",
+            "{name}.mp4 is {} bytes",
+            mp4.len()
+        );
+    }
+}
+
 /// `completions` renders a usable script naming the `gen` subcommand.
 #[test]
 fn completions_render_for_bash() {

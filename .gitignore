@@ -1,3 +1,5 @@
 /target
 /out
 build-target.log
+.venv/
+__pycache__/

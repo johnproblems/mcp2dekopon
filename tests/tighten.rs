@@ -472,3 +472,185 @@ fn keyword_fields_use_raw_idents() {
     assert!(fields.contains(&"r#type"), "{fields:?}");
     assert!(fields.contains(&"self_"), "{fields:?}");
 }
+
+#[test]
+fn boolean_schemas_lower_to_any() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "anything": true,
+            "nothing": false,
+        },
+    });
+    let tightened = tighten(schema).unwrap();
+    assert!(tightened.warnings.contains("false-schema-loosened"));
+    snapshot("tighten_boolean_schemas", &tightened);
+}
+
+#[test]
+fn empty_type_array_loosens_instead_of_skipping() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "vague": {"type": []},
+            "nil": {"type": ["null"]},
+        },
+    });
+    let tightened = tighten(schema).unwrap();
+    assert!(tightened.warnings.contains("empty-type-loosened"));
+    snapshot("tighten_empty_type", &tightened);
+}
+
+#[test]
+fn dropped_constraints_warn_loudly() {
+    let schema = json!({
+        "type": "object",
+        "not": {"type": "null"},
+        "properties": {
+            "count": {"type": "integer", "if": {"minimum": 1}, "then": {"maximum": 9}},
+            "pair": {"type": "array", "prefixItems": [{"type": "string"}], "items": {"type": "string"}},
+        },
+    });
+    let tightened = tighten(schema).unwrap();
+    assert!(tightened.warnings.contains("schema-constraint-dropped"));
+    assert!(tightened.warnings.contains("tuple-validation-dropped"));
+    snapshot("tighten_dropped_constraints", &tightened);
+}
+
+#[test]
+fn mixed_and_empty_enums_warn() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "mixed": {"enum": ["a", 1]},
+            "empty": {"enum": []},
+        },
+    });
+    let tightened = tighten(schema).unwrap();
+    assert!(tightened.warnings.contains("enum-not-constrained"));
+    snapshot("tighten_mixed_enum", &tightened);
+}
+
+#[test]
+fn identical_scalar_union_collapses() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "value": {"oneOf": [{"type": "string"}, {"type": "string"}]},
+        },
+        "required": ["value"],
+    });
+    let tightened = tighten(schema).unwrap();
+    assert!(matches!(
+        tightened.fields[0].field_type,
+        mcp2dekopon::tighten::FieldType::String
+    ));
+    snapshot("tighten_scalar_collapse", &tightened);
+}
+
+#[test]
+fn nullable_object_branches_join_unions() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "target": {
+                "oneOf": [
+                    {"type": ["object", "null"], "properties": {"repo": {"type": "string"}}, "required": ["repo"]},
+                    {"type": "object", "properties": {"gist": {"type": "string"}}},
+                ],
+            },
+        },
+        "required": ["target"],
+    });
+    let tightened = tighten(schema).unwrap();
+    assert!(!tightened.fields[0].required);
+    snapshot("tighten_nullable_union", &tightened);
+}
+
+#[test]
+fn nested_allof_flattens() {
+    let schema = json!({
+        "type": "object",
+        "$defs": {
+            "Base": {
+                "allOf": [
+                    {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]},
+                    {"type": "object", "properties": {"b": {"type": "integer"}}},
+                ],
+            },
+        },
+        "properties": {
+            "merged": {"allOf": [{"$ref": "#/$defs/Base"}, {"type": ["object", "null"], "properties": {"c": {"type": "boolean"}}}]},
+        },
+        "required": ["merged"],
+    });
+    let tightened = tighten(schema).unwrap();
+    assert!(tightened.flags.contains("allof-merged"));
+    snapshot("tighten_nested_allof", &tightened);
+}
+
+#[test]
+fn recursive_allof_skips() {
+    let schema = json!({
+        "type": "object",
+        "$defs": {
+            "A": {"allOf": [{"$ref": "#/$defs/B"}, {"type": "object", "properties": {"a": {"type": "string"}}}]},
+            "B": {"allOf": [{"$ref": "#/$defs/A"}, {"type": "object", "properties": {"b": {"type": "string"}}}]},
+        },
+        "properties": {
+            "merged": {"$ref": "#/$defs/A"},
+        },
+    });
+    let error = tighten(schema).unwrap_err();
+    assert!(error.starts_with("recursive-schema"), "{error}");
+}
+
+#[test]
+fn nested_combined_flattens_through_refs() {
+    let schema = json!({
+        "type": "object",
+        "$defs": {
+            "Alias": {"oneOf": [{"type": "string"}, {"type": "integer"}]},
+        },
+        "properties": {
+            "value": {"oneOf": [{"$ref": "#/$defs/Alias"}, {"type": "boolean"}]},
+        },
+        "required": ["value"],
+    });
+    snapshot("tighten_nested_combined", &tighten(schema).unwrap());
+}
+
+#[test]
+fn recursive_combined_skips() {
+    let schema = json!({
+        "type": "object",
+        "$defs": {
+            "Loop": {"oneOf": [{"$ref": "#/$defs/Loop"}, {"type": "string"}]},
+        },
+        "properties": {
+            "value": {"$ref": "#/$defs/Loop"},
+        },
+    });
+    let error = tighten(schema).unwrap_err();
+    assert!(error.starts_with("recursive-schema"), "{error}");
+}
+
+#[test]
+fn percent_encoded_refs_resolve() {
+    let schema = json!({
+        "type": "object",
+        "$defs": {
+            "weird name": {"type": "string"},
+        },
+        "properties": {
+            "value": {"$ref": "#/$defs/weird%20name"},
+        },
+        "required": ["value"],
+    });
+    let tightened = tighten(schema).unwrap();
+    assert!(matches!(
+        tightened.fields[0].field_type,
+        mcp2dekopon::tighten::FieldType::String
+    ));
+    snapshot("tighten_percent_ref", &tightened);
+}

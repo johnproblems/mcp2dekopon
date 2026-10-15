@@ -41,27 +41,37 @@ which builds the generated crate to wasm32 and runs
 
 - Fetch (`src/fetch.rs`): `initialize`, then paginated `tools/list`, reading
   `name`, `description`, `inputSchema`, `annotations`. Retry covers timeouts,
-  refused connections, and 5xx; 401/403/407 stop with a `--header` hint; an
-  expired session re-initializes once per page. Verified by the `Mode` matrix
-  in `tests/gen_mock.rs` (flaky, infinite-cursor, wrong-id, 401, old-version,
-  many-tools).
+  refused connections, 5xx, and 429 (honoring `Retry-After` up to 30 s);
+  401/403/407 stop with a `--header` hint; an expired session (400/404/409)
+  re-initializes once per page; a repeated cursor fails fast; bodies and
+  captures over 16 MiB are refused. Every request carries a
+  `mcp2dekopon/<version>` user-agent. Verified by the `Mode` matrix in
+  `tests/gen_mock.rs` (flaky, infinite-cursor, repeated-cursor, wrong-id,
+  401, 404, 409, rate-limited, persistent-429, oversized-body, empty-name,
+  old-version, many-tools).
 - Tighten (`src/tighten.rs`): local `$ref`/`$defs` inlined (JSON pointers
   included), recursion skipped (`recursive-schema`), `additionalProperties:
   false` everywhere, free maps as parsed JSON strings (`free-map-as-string`),
-  `oneOf`/`anyOf` of objects as untagged enums, kebab-case flags and
-  `snake_case` fields with `#[serde(rename)]`. Widenings beyond the PRD:
-  scalar unions, `allOf` merging, and a depth bound (`schema-too-deep`).
-  Verified by the 26 golden tests in `tests/tighten.rs`.
+  `oneOf`/`anyOf` of objects as untagged enums, kebab-case flags (camel
+  humps split) and `snake_case` fields with `#[serde(rename)]`. Widenings
+  beyond the PRD: scalar unions, `allOf` merging, nested `oneOf`/`anyOf`/
+  `allOf` flattening, identical-scalar collapse, nullable union branches,
+  boolean schemas, percent-decoded `$ref`s, a depth bound
+  (`schema-too-deep`), and warnings for dropped logic keywords
+  (`schema-constraint-dropped`, `tuple-validation-dropped`). Verified by the
+  37 golden tests in `tests/tighten.rs`.
 - Render (`src/codegen.rs`): one `Capability` per tool, at most 32 per
   provider, larger servers split into `<id>-1`, `<id>-2`
-  (`split_tools` unit tests); `run` replays `initialize` then `tools/call`
-  and prints MCP `content` as one JSON line; `isError` answers print then
-  fail. Verified by generated `e2e_*` tests and the error-path tests for the
-  first tool of every provider.
+  (`split_tools` unit tests, with split-aware name budgets); `run` replays
+  `initialize`, the `notifications/initialized` notice, then `tools/call`,
+  verifies the call response id, and prints MCP `content` as one JSON line;
+  `isError` answers print then fail. Verified by generated `e2e_*` tests and
+  the error-path tests for the first tool of every provider.
 - Broker fragment: per-capability `http` grants pinned to one origin,
-  POST-only, `maxRequests: 2`, byte limits, commented `credential:` slot.
-  The provider never sees a token: fetch `--header` values are never written
-  to generated files (only used for `tools/list`).
+  POST-only, `maxRequests: 3`, byte limits, a `timeoutMs` mirroring
+  `--timeout-secs`, commented `credential:` slot. The provider never sees a
+  token: fetch `--header` values are never written to generated files (only
+  used for `tools/list`).
 - Effect labels: `readOnlyHint` to `read-only`/`Low`, `destructiveHint` to
   `external-write`/`High`, else `external-write`/`Medium`; every label lands
   in `report.json` for operator review (asserted per capability in
@@ -76,9 +86,10 @@ tests per rule, generated crates built in CI with `conformance()`, and one
 e2e call per reference server, plus generated error-path, propose, CLI-help,
 manifest, and unknown-capability tests.
 
-- Stateful servers: every invocation re-runs `initialize` (one extra
-  request); no allowlist of rejecting servers has been needed so far, and
-  adding one is a data change, not a code change.
+- Stateful servers: every invocation re-runs `initialize` plus the
+  `notifications/initialized` notice (two extra requests); no allowlist of
+  rejecting servers has been needed so far, and adding one is a data change,
+  not a code change.
 - Messy schemas: skipped with a reason; the skip rate is auditable via the
   report `summary` block.
 - SSE answers: buffered and parsed (`post_once` in `src/fetch.rs`,
@@ -94,6 +105,12 @@ manifest, and unknown-capability tests.
    requires reading `Base` from `providerSettings.<id>.baseUrl`, which needs
    the `Settings` need; the implemented shape honors that requirement and
    enables pointing a deployment at another endpoint without rebuilding.
-2. The report carries `summary`, `warnings`, and per-skip `description`
-   fields the PRD does not name. These are additive: every PRD-required
-   element (capability labels, skip reasons) is present unchanged.
+2. The report carries `format_version`, `elapsed_ms`, `options`, `summary`,
+   `warnings`, and per-skip `description` fields the PRD does not name.
+   These are additive: every PRD-required element (capability labels, skip
+   reasons) is present unchanged.
+3. Every call sends the `notifications/initialized` notice (best effort)
+   between `initialize` and `tools/call`, and the broker fragment allows
+   `maxRequests: 3` instead of the PRD's 2. Strict servers reject calls
+   without the notice; lenient ones ignore it, so the notice maximizes
+   interop at the cost of one request the PRD did not budget.

@@ -67,15 +67,28 @@ pub struct ReportWarning {
 /// The full generation report, written to `<out>/report.json`.
 #[derive(Clone, Debug, Serialize)]
 pub struct GenerationReport {
+    pub format_version: u32,
     pub generator: String,
     pub generator_version: String,
     pub sdk_version: String,
     pub generated_at: String,
+    pub elapsed_ms: u64,
+    pub options: ReportOptions,
     pub summary: ReportSummary,
     pub server: ReportServer,
     pub providers: Vec<ReportProvider>,
     pub warnings: Vec<ReportWarning>,
     pub skipped: Vec<SkippedTool>,
+}
+
+/// The run options behind a report, so a report is reproducible: the same
+/// options against the same tool list render the same report.
+#[derive(Clone, Debug, Serialize)]
+pub struct ReportOptions {
+    pub offered_protocol_version: String,
+    pub timeout_secs: u64,
+    pub max_attempts: u32,
+    pub max_tools: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -117,12 +130,17 @@ fn now_rfc3339() -> String {
     unix_to_rfc3339(secs)
 }
 
+/// Report schema version; bumped when fields are added or removed.
+pub const REPORT_FORMAT_VERSION: u32 = 1;
+
 pub fn build_report(
     endpoint: &str,
     server: &ServerInfo,
     listed: usize,
     providers: Vec<(String, String, Vec<TightenedTool>)>,
     skipped: Vec<SkippedTool>,
+    options: ReportOptions,
+    elapsed_ms: u64,
 ) -> GenerationReport {
     let mut by_code: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
@@ -139,10 +157,13 @@ pub fn build_report(
         }
     }
     GenerationReport {
+        format_version: REPORT_FORMAT_VERSION,
         generator: "mcp2dekopon".to_string(),
         generator_version: env!("CARGO_PKG_VERSION").to_string(),
         sdk_version: crate::SDK_VERSION.to_string(),
         generated_at: now_rfc3339(),
+        elapsed_ms,
+        options,
         summary: ReportSummary {
             listed,
             generated,
@@ -183,7 +204,8 @@ pub fn build_report(
 
 #[cfg(test)]
 mod tests {
-    use super::unix_to_rfc3339;
+    use super::{unix_to_rfc3339, ReportOptions, REPORT_FORMAT_VERSION};
+    use crate::fetch::ServerInfo;
 
     #[test]
     fn epoch_and_known_dates_render_as_rfc3339() {
@@ -192,5 +214,46 @@ mod tests {
         assert_eq!(unix_to_rfc3339(1_700_000_000), "2023-11-14T22:13:20Z");
         // Leap day, `date -u -d @951827696` ground truth.
         assert_eq!(unix_to_rfc3339(951_827_696), "2000-02-29T12:34:56Z");
+    }
+
+    #[test]
+    fn reports_carry_version_options_and_elapsed() {
+        let server = ServerInfo {
+            name: "mock".to_string(),
+            version: "0".to_string(),
+            protocol_version: "2025-06-18".to_string(),
+        };
+        let report = super::build_report(
+            "http://127.0.0.1:1/mcp",
+            &server,
+            0,
+            Vec::new(),
+            Vec::new(),
+            ReportOptions {
+                offered_protocol_version: "2025-06-18".to_string(),
+                timeout_secs: 7,
+                max_attempts: 2,
+                max_tools: 50,
+            },
+            123,
+        );
+        assert_eq!(report.format_version, REPORT_FORMAT_VERSION);
+        assert_eq!(report.format_version, 1);
+        assert_eq!(report.elapsed_ms, 123);
+        assert_eq!(report.options.offered_protocol_version, "2025-06-18");
+        assert_eq!(report.options.timeout_secs, 7);
+        assert_eq!(report.options.max_attempts, 2);
+        assert_eq!(report.options.max_tools, 50);
+        let text = serde_json::to_string(&report).unwrap();
+        for key in [
+            "format_version",
+            "elapsed_ms",
+            "options",
+            "offered_protocol_version",
+            "max_attempts",
+            "max_tools",
+        ] {
+            assert!(text.contains(key), "{text}");
+        }
     }
 }

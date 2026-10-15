@@ -1,0 +1,28 @@
+{
+  "mcp_name": "probe",
+  "cap_name": "probe",
+  "description": "Tool probe",
+  "fields": [
+    {
+      "mcp_name": "nil",
+      "rust_name": "nil",
+      "type": "Any",
+      "required": false,
+      "description": ""
+    },
+    {
+      "mcp_name": "vague",
+      "rust_name": "vague",
+      "type": "Any",
+      "required": false,
+      "description": ""
+    }
+  ],
+  "top_level_map": false,
+  "effect": "ExternalWrite",
+  "risk": "Medium",
+  "flags": [],
+  "warnings": [
+    "empty-type-loosened"
+  ]
+}

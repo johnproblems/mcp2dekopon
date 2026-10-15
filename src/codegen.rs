@@ -25,6 +25,8 @@ pub struct ProviderSpec<'a> {
     pub endpoint: &'a Endpoint,
     pub server: &'a ServerInfo,
     pub generator_version: String,
+    /// Per-request fetch timeout, mirrored into the broker fragment.
+    pub timeout_secs: u64,
 }
 
 /// One file to write, relative to the provider directory.
@@ -113,7 +115,27 @@ pub fn render_provider(spec: &ProviderSpec<'_>) -> Vec<GeneratedFile> {
     ]
 }
 
+/// Writes one file atomically: the content lands in a sibling temp file
+/// first, then renames over the target, so a failure never leaves a
+/// half-written file behind.
+pub fn write_file_atomic(path: &Path, content: String) -> Result<(), String> {
+    let tmp = PathBuf::from(format!("{}.tmp-{}", path.display(), std::process::id()));
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&tmp, content).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("cannot write {}: {e}", path.display())
+    })
+}
+
 /// Writes one provider directory. Refuses to overwrite unless `force` is set.
+/// Files render into a sibling staging directory first and swap into place,
+/// so a failure leaves no half-written crate; a `--force` regeneration
+/// replaces the directory wholesale, so stale artifacts (a previous
+/// `<id>.wasm` included) cannot survive to confuse `conformance()`.
 pub fn write_provider(dir: &Path, files: &[GeneratedFile], force: bool) -> Result<(), String> {
     if dir.exists() && !force {
         return Err(format!(
@@ -121,24 +143,40 @@ pub fn write_provider(dir: &Path, files: &[GeneratedFile], force: bool) -> Resul
             dir.display()
         ));
     }
-    for file in files {
-        let path = dir.join(&file.path);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    let staging = PathBuf::from(format!("{}.tmp-{}", dir.display(), std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    let staged = (|| -> Result<(), String> {
+        for file in files {
+            let path = staging.join(&file.path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+            }
+            std::fs::write(&path, &file.content)
+                .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+            #[cfg(unix)]
+            if file.executable {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&path)
+                    .map_err(|e| format!("cannot stat {}: {e}", path.display()))?
+                    .permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&path, permissions)
+                    .map_err(|e| format!("cannot chmod {}: {e}", path.display()))?;
+            }
         }
-        std::fs::write(&path, &file.content)
-            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-        #[cfg(unix)]
-        if file.executable {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&path)
-                .map_err(|e| format!("cannot stat {}: {e}", path.display()))?
-                .permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&path, permissions)
-                .map_err(|e| format!("cannot chmod {}: {e}", path.display()))?;
-        }
+        Ok(())
+    })();
+    if let Err(error) = staged {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    if force {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    if let Err(error) = std::fs::rename(&staging, dir) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(format!("cannot write {}: {error}", dir.display()));
     }
     Ok(())
 }
@@ -206,6 +244,12 @@ impl Naming {
 /// Renders a Rust string literal, quoted and escaped.
 fn lit(value: &str) -> String {
     format!("{value:?}")
+}
+
+/// Escapes one Markdown table cell: pipes would split the column, and
+/// newlines would break the row layout.
+fn md_cell(value: &str) -> String {
+    value.replace('|', "\\|").replace('\n', " ")
 }
 
 /// Renders description lines as doc comments.
@@ -348,7 +392,7 @@ fn render_lib(spec: &ProviderSpec<'_>, naming: &Naming) -> String {
          \x20   InvalidRequest(HttpBuildError),\n\
          \x20   Http(HttpError),\n\
          \x20   HttpStatus(u16),\n\
-         \x20   Protocol(&'static str),\n\
+         \x20   Protocol(String),\n\
          \x20   Rpc {\n\
          \x20       code: i64,\n\
          \x20       message: String,\n\
@@ -431,21 +475,30 @@ fn render_helpers(out: &mut String, spec: &ProviderSpec<'_>) {
          \x20   header_bytes(response, \"content-type\").and_then(|value| std::str::from_utf8(value).ok())\n\
          }\n\
          \n\
+         /// The first 120 characters of a body, for error messages.\n\
+         fn snippet(text: &str) -> String {\n\
+         \x20   if text.chars().count() <= 120 {\n\
+         \x20       return text.to_string();\n\
+         \x20   }\n\
+         \x20   let mut short: String = text.chars().take(120).collect();\n\
+         \x20   short.push_str(\"...\");\n\
+         \x20   short\n\
+         }\n\
+         \n\
          /// Parses one response body: plain JSON, or the buffered SSE event carrying\n\
          /// the JSON-RPC message.\n\
          fn parse_rpc_body(body: &[u8], content_type: Option<&str>) -> Result<Value, McpError> {\n\
-         \x20   let text =\n\
-         \x20       std::str::from_utf8(body).map_err(|_| McpError::Protocol(\"response body was not UTF-8\"))?;\n\
+         \x20   let text = std::str::from_utf8(body)\n\
+         \x20       .map_err(|_| McpError::Protocol(\"response body was not UTF-8\".to_string()))?;\n\
          \x20   let looks_sse = content_type\n\
          \x20       .is_some_and(|kind| kind.to_ascii_lowercase().contains(\"text/event-stream\"))\n\
          \x20       || text.trim_start().starts_with(\"data:\")\n\
          \x20       || text.trim_start().starts_with(\"event:\");\n\
+         \x20   let not_json = || McpError::Protocol(format!(\"response body was not JSON: {}\", snippet(text)));\n\
          \x20   if looks_sse {\n\
-         \x20       sse_json(text).or_else(|_| {\n\
-         \x20           serde_json::from_str(text).map_err(|_| McpError::Protocol(\"response body was not JSON\"))\n\
-         \x20       })\n\
+         \x20       sse_json(text).or_else(|_| serde_json::from_str(text).map_err(|_| not_json()))\n\
          \x20   } else {\n\
-         \x20       serde_json::from_str(text).map_err(|_| McpError::Protocol(\"response body was not JSON\"))\n\
+         \x20       serde_json::from_str(text).map_err(|_| not_json())\n\
          \x20   }\n\
          }\n\
          \n\
@@ -479,7 +532,10 @@ fn render_helpers(out: &mut String, spec: &ProviderSpec<'_>) {
          \x20           }\n\
          \x20       }\n\
          \x20   }\n\
-         \x20   Err(McpError::Protocol(\"no JSON-RPC message in SSE response\"))\n\
+         \x20   Err(McpError::Protocol(format!(\n\
+         \x20       \"no JSON-RPC message in SSE response: {}\",\n\
+         \x20       snippet(text)\n\
+         \x20   )))\n\
          }\n\
          \n\
          /// Splits a JSON-RPC message into its result or its error.\n\
@@ -496,7 +552,7 @@ fn render_helpers(out: &mut String, spec: &ProviderSpec<'_>) {
          \x20   payload\n\
          \x20       .get(\"result\")\n\
          \x20       .filter(|result| result.is_object())\n\
-         \x20       .ok_or(McpError::Protocol(\"JSON-RPC response had no result\"))\n\
+         \x20       .ok_or_else(|| McpError::Protocol(\"JSON-RPC response had no result\".to_string()))\n\
          }\n\
          \n\
          /// Reads the negotiated protocol version from an `initialize` answer, if any.\n\
@@ -509,8 +565,9 @@ fn render_helpers(out: &mut String, spec: &ProviderSpec<'_>) {
          \x20       .map(str::to_owned)\n\
          }\n\
          \n\
-         /// Runs one MCP round trip against `base`: `initialize`, then\n\
-         /// `tools/call` for `tool`, printing the MCP `content` as one JSON line.\n\
+         /// Runs one MCP round trip against `base`: `initialize`, the\n\
+         /// `notifications/initialized` notice (best effort), then `tools/call`\n\
+         /// for `tool`, printing the MCP `content` as one JSON line.\n\
          fn call_mcp(\n\
          \x20   http: &Http,\n\
          \x20   base: &Base,\n\
@@ -540,6 +597,23 @@ fn render_helpers(out: &mut String, spec: &ProviderSpec<'_>) {
          \x20   }\n\
          \x20   let session = header_bytes(&init_response, \"mcp-session-id\").map(<[u8]>::to_vec);\n\
          \x20   let protocol = init_protocol(&init_response).unwrap_or_else(|| MCP_PROTOCOL_VERSION.to_owned());\n\
+         \x20   // Best effort: some servers require the notice before `tools/call`,\n\
+         \x20   // others reject it; either way the call proceeds.\n\
+         \x20   let notice = json!({\"jsonrpc\": \"2.0\", \"method\": \"notifications/initialized\"});\n\
+         \x20   let notice_request = (|| -> Result<Request, McpError> {\n\
+         \x20       let mut request = Request::new(method::POST, &url)\n\
+         \x20           .map_err(McpError::InvalidRequest)?\n\
+         \x20           .with_header(ht(\"content-type\", \"application/json\")?)\n\
+         \x20           .with_header(ht(\"accept\", \"application/json, text/event-stream\")?)\n\
+         \x20           .with_header(ht(\"mcp-protocol-version\", &protocol)?);\n\
+         \x20       if let Some(session) = &session {\n\
+         \x20           request = request.with_header(hb(\"mcp-session-id\", session.clone())?);\n\
+         \x20       }\n\
+         \x20       Ok(request.with_body(notice.to_string().into_bytes()))\n\
+         \x20   })();\n\
+         \x20   if let Ok(notice_request) = notice_request {\n\
+         \x20       let _ignored = http.send(notice_request);\n\
+         \x20   }\n\
          \x20   let call = json!({\n\
          \x20       \"jsonrpc\": \"2.0\",\n\
          \x20       \"id\": 2,\n\
@@ -560,6 +634,14 @@ fn render_helpers(out: &mut String, spec: &ProviderSpec<'_>) {
          \x20       return Err(McpError::HttpStatus(call_response.status));\n\
          \x20   }\n\
          \x20   let payload = parse_rpc_body(&call_response.body, content_type_of(&call_response))?;\n\
+         \x20   if payload.get(\"id\") != Some(&json!(2)) {\n\
+         \x20       let got = payload\n\
+         \x20           .get(\"id\")\n\
+         \x20           .map_or_else(|| \"missing\".to_string(), Value::to_string);\n\
+         \x20       return Err(McpError::Protocol(format!(\n\
+         \x20           \"response id {got} did not match request 2\"\n\
+         \x20       )));\n\
+         \x20   }\n\
          \x20   let result = rpc_result(&payload)?;\n\
          \x20   let content = result.get(\"content\").unwrap_or(result);\n\
          \x20   let line = serde_json::to_string(content).map_err(|_| McpError::Encoding)?;\n\
@@ -1119,8 +1201,8 @@ fn render_build_sh(spec: &ProviderSpec<'_>, crate_name: &str) -> String {
          }}\n\
          if wasm_version=$(wasm-tools --version 2>/dev/null); then\n\
          \x20 case \"$wasm_version\" in\n\
-         \x20   *\" 1.259.0\"*) ;;\n\
-         \x20   *) echo \"warning: $wasm_version (generated code is tested with wasm-tools 1.259.0)\" >&2 ;;\n\
+         \x20   *\" 1.259.\"*) ;;\n\
+         \x20   *) echo \"warning: $wasm_version (generated code is tested with wasm-tools 1.259.x)\" >&2 ;;\n\
          \x20 esac\n\
          fi\n\
          wasm-tools component new \"target/wasm32-unknown-unknown/release/{crate_name}.wasm\" -o \"{id}.wasm\"\n\
@@ -1243,7 +1325,7 @@ fn render_native_e2e(spec: &ProviderSpec<'_>, naming: &Naming, crate_name: &str)
          \n\
          /// One scripted MCP origin answering `tools/call` with `cap` content. The same\n\
          /// answer feeds the `initialize` leg, which tolerates it and falls back to the\n\
-         /// offered protocol version; each test asserts both request legs.\n\
+         /// offered protocol version; each test asserts all three request legs.\n\
          fn scripted(cap: &str) -> HttpScript {{\n\
          \x20   let body = json!({{\n\
          \x20       \"jsonrpc\": \"2.0\",\n\
@@ -1301,10 +1383,12 @@ fn render_native_e2e(spec: &ProviderSpec<'_>, naming: &Naming, crate_name: &str)
              \x20   let actual: Value = serde_json::from_slice(&output.stdout).expect(\"stdout is JSON\");\n\
              \x20   assert_eq!(actual, expected);\n\
              \x20   let requests = native.requests();\n\
-             \x20   assert_eq!(requests.len(), 2, \"initialize plus tools/call\");\n\
+             \x20   assert_eq!(requests.len(), 3, \"initialize, notice, plus tools/call\");\n\
              \x20   let init: Value = serde_json::from_slice(&requests[0].body).expect(\"init body\");\n\
              \x20   assert_eq!(init[\"method\"], \"initialize\");\n\
-             \x20   let call: Value = serde_json::from_slice(&requests[1].body).expect(\"call body\");\n\
+             \x20   let notice: Value = serde_json::from_slice(&requests[1].body).expect(\"notice body\");\n\
+             \x20   assert_eq!(notice[\"method\"], \"notifications/initialized\");\n\
+             \x20   let call: Value = serde_json::from_slice(&requests[2].body).expect(\"call body\");\n\
              \x20   assert_eq!(call[\"method\"], \"tools/call\");\n\
              \x20   assert_eq!(call[\"params\"][\"name\"], {mcp_lit});\n\
              }}\n\
@@ -1552,7 +1636,8 @@ fn render_broker(spec: &ProviderSpec<'_>) -> String {
          #\n\
          # Install: copy this file into your broker.d/ directory and add a policy to a\n\
          # `*.cedar` file (see ../{id}.cedar). Every capability below may POST only to\n\
-         # {origin}, at most twice per call (initialize plus tools/call).\n\
+         # {origin}, at most three times per call (initialize, the initialized\n\
+         # notice, plus tools/call).\n\
          #\n\
          # Review the effect labels in ../report.json before granting anything: a wrong\n\
          # `read-only` would place a capability in the provider's `read-only` group.\n",
@@ -1586,16 +1671,17 @@ fn render_broker(spec: &ProviderSpec<'_>) -> String {
             "      {id}.{cap}:\n\
              \x20       # credential: <name-in-broker-credentials.yaml>  # uncomment when the MCP server needs auth\n\
              \x20       constraints:\n\
-             \x20         timeoutMs: 30000\n\
+             \x20         timeoutMs: {timeout_ms}\n\
              \x20         http:\n\
              \x20           allowedHosts: [{host}]\n\
              \x20           allowedMethods: [POST]\n\
-             \x20           maxRequests: 2\n\
+             \x20           maxRequests: 3\n\
              \x20           maxRequestBytes: 65536\n\
              \x20           maxResponseBytes: 1048576\n",
             id = spec.id,
             cap = tool.cap_name,
             host = spec.endpoint.host_scope,
+            timeout_ms = spec.timeout_secs.saturating_mul(1000),
         ));
         if spec.endpoint.plaintext_loopback {
             out.push_str("            allowPlaintextLoopback: true\n");
@@ -1669,13 +1755,23 @@ fn render_readme(spec: &ProviderSpec<'_>) -> String {
         };
         out.push_str(&format!(
             "| `{id}.{cap}` | `{tool}` | {effect} | {risk} | {notes} |\n",
-            id = spec.id,
-            cap = tool.cap_name,
-            tool = tool.mcp_name,
+            id = md_cell(&spec.id),
+            cap = md_cell(&tool.cap_name),
+            tool = md_cell(&tool.mcp_name),
             effect = tool.effect.wire(),
             risk = tool.risk.wire(),
-            notes = notes,
+            notes = md_cell(&notes),
         ));
+    }
+    if spec.endpoint.plaintext_note.is_some() {
+        out.push_str(
+            "\n\
+             ## Security note\n\
+             \n\
+             This provider talks plaintext HTTP outside loopback. The broker\n\
+             fragment alone cannot authorize that: the broker also needs an\n\
+             `http.plaintextHosts` entry in host.yaml covering the origin.\n",
+        );
     }
     out.push_str(&format!(
         "\n\
@@ -1743,7 +1839,8 @@ pub fn split_tools(id: &str, tools: &[TightenedTool]) -> Result<Vec<(String, Pat
 
 #[cfg(test)]
 mod tests {
-    use super::{description_const, lit, split_tools};
+    use super::{description_const, lit, md_cell, split_tools};
+    use crate::fetch::{Endpoint, ServerInfo};
     use crate::tighten::{Effect, Risk, TightenedTool};
 
     fn tool(name: &str) -> TightenedTool {
@@ -1757,6 +1854,33 @@ mod tests {
             risk: Risk::Medium,
             flags: Default::default(),
             warnings: Default::default(),
+        }
+    }
+
+    fn unit_dir(suite: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("mcp2dekopon-unit-{suite}-{}", std::process::id()))
+    }
+
+    fn spec<'a>(
+        tools: &'a [TightenedTool],
+        endpoint: &'a Endpoint,
+        server: &'a ServerInfo,
+    ) -> super::ProviderSpec<'a> {
+        super::ProviderSpec {
+            id: "mockmcp".to_string(),
+            tools,
+            endpoint,
+            server,
+            generator_version: "0.0.0-test".to_string(),
+            timeout_secs: 7,
+        }
+    }
+
+    fn server() -> ServerInfo {
+        ServerInfo {
+            name: "mock-mcp".to_string(),
+            version: "0.0.0".to_string(),
+            protocol_version: crate::MCP_PROTOCOL_VERSION.to_string(),
         }
     }
 
@@ -1775,6 +1899,152 @@ mod tests {
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].0, "mockmcp-1");
         assert_eq!(parts[1].0, "mockmcp-2");
+    }
+
+    #[test]
+    fn markdown_cells_escape_pipes_and_newlines() {
+        assert_eq!(md_cell("plain"), "plain");
+        assert_eq!(md_cell("a|b"), "a\\|b");
+        assert_eq!(md_cell("a\nb"), "a b");
+    }
+
+    #[test]
+    fn atomic_file_write_leaves_no_tmp_behind() {
+        let dir = unit_dir("atomic");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("report.json");
+        super::write_file_atomic(&path, "{\"ok\":true}\n".to_string()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"ok\":true}\n");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers.len(), 1, "{leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn provider_write_replaces_the_directory_on_force() {
+        let dir = unit_dir("provider");
+        let _ = std::fs::remove_dir_all(&dir);
+        let endpoint = crate::fetch::validate_endpoint("http://127.0.0.1:1/mcp").unwrap();
+        let server = server();
+        let tools = vec![tool("search")];
+        let files = super::render_provider(&spec(&tools, &endpoint, &server));
+        let out = dir.join("mockmcp");
+        super::write_provider(&out, &files, false).unwrap();
+        assert!(out.join("src/lib.rs").is_file());
+        // Without --force the second write refuses,...
+        assert!(super::write_provider(&out, &files, false).is_err());
+        // ... while --force swaps the directory wholesale: stray files
+        // (notes, a stale component) do not survive.
+        std::fs::write(out.join("notes.txt"), "operator notes").unwrap();
+        std::fs::write(out.join("mockmcp.wasm"), "stale").unwrap();
+        super::write_provider(&out, &files, true).unwrap();
+        assert!(out.join("src/lib.rs").is_file());
+        assert!(!out.join("notes.txt").exists());
+        assert!(!out.join("mockmcp.wasm").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broker_fragment_carries_timeout_and_three_requests() {
+        let endpoint = crate::fetch::validate_endpoint("http://127.0.0.1:1/mcp").unwrap();
+        let server = server();
+        let tools = vec![tool("search")];
+        let files = super::render_provider(&spec(&tools, &endpoint, &server));
+        let broker = files
+            .iter()
+            .find(|file| file.path == "broker.d/mockmcp.yaml")
+            .unwrap();
+        assert!(
+            broker.content.contains("timeoutMs: 7000"),
+            "{}",
+            broker.content
+        );
+        assert!(
+            broker.content.contains("maxRequests: 3"),
+            "{}",
+            broker.content
+        );
+        assert!(
+            broker.content.contains("at most three times per call"),
+            "{}",
+            broker.content
+        );
+    }
+
+    #[test]
+    fn readme_escapes_pipes_and_warns_on_plaintext() {
+        let loopback = crate::fetch::validate_endpoint("http://127.0.0.1:1/mcp").unwrap();
+        let lan = crate::fetch::validate_endpoint("http://rpi.lan:8080/mcp").unwrap();
+        let server = server();
+        let mut piped = tool("search");
+        piped.mcp_name = "a|b".to_string();
+        let tools = vec![piped];
+        let lan_files = super::render_provider(&spec(&tools, &lan, &server));
+        let readme = lan_files
+            .iter()
+            .find(|file| file.path == "README.md")
+            .unwrap();
+        assert!(readme.content.contains("`a\\|b`"), "{}", readme.content);
+        assert!(
+            readme.content.contains("## Security note"),
+            "{}",
+            readme.content
+        );
+        let local_files = super::render_provider(&spec(&tools, &loopback, &server));
+        let readme = local_files
+            .iter()
+            .find(|file| file.path == "README.md")
+            .unwrap();
+        assert!(
+            !readme.content.contains("## Security note"),
+            "{}",
+            readme.content
+        );
+    }
+
+    #[test]
+    fn generated_lib_sends_the_notice_and_checks_ids() {
+        let endpoint = crate::fetch::validate_endpoint("http://127.0.0.1:1/mcp").unwrap();
+        let server = server();
+        let tools = vec![tool("search")];
+        let files = super::render_provider(&spec(&tools, &endpoint, &server));
+        let lib = files.iter().find(|file| file.path == "src/lib.rs").unwrap();
+        for needle in [
+            "notifications/initialized",
+            "did not match request 2",
+            "Protocol(String)",
+            "fn snippet",
+        ] {
+            assert!(lib.content.contains(needle), "missing {needle}");
+        }
+        let e2e = files
+            .iter()
+            .find(|file| file.path == "tests/native_e2e.rs")
+            .unwrap();
+        assert!(e2e.content.contains("requests.len(), 3"), "{}", e2e.content);
+        assert!(
+            e2e.content.contains("notifications/initialized"),
+            "{}",
+            e2e.content
+        );
+    }
+
+    #[test]
+    fn build_script_accepts_patch_releases() {
+        let endpoint = crate::fetch::validate_endpoint("http://127.0.0.1:1/mcp").unwrap();
+        let server = server();
+        let tools = vec![tool("search")];
+        let files = super::render_provider(&spec(&tools, &endpoint, &server));
+        let build = files.iter().find(|file| file.path == "build.sh").unwrap();
+        assert!(build.content.contains("*\" 1.259.\"*"), "{}", build.content);
+        assert!(
+            build.content.contains("wasm-tools 1.259.x"),
+            "{}",
+            build.content
+        );
     }
 
     #[test]

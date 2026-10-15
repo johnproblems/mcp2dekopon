@@ -1,0 +1,48 @@
+{
+  "mcp_name": "probe",
+  "cap_name": "probe",
+  "description": "Tool probe",
+  "fields": [
+    {
+      "mcp_name": "merged",
+      "rust_name": "merged",
+      "type": {
+        "Object": {
+          "type_name": "ProbeMerged",
+          "fields": [
+            {
+              "mcp_name": "a",
+              "rust_name": "a",
+              "type": "String",
+              "required": true,
+              "description": ""
+            },
+            {
+              "mcp_name": "b",
+              "rust_name": "b",
+              "type": "Integer",
+              "required": false,
+              "description": ""
+            },
+            {
+              "mcp_name": "c",
+              "rust_name": "c",
+              "type": "Boolean",
+              "required": false,
+              "description": ""
+            }
+          ]
+        }
+      },
+      "required": true,
+      "description": ""
+    }
+  ],
+  "top_level_map": false,
+  "effect": "ExternalWrite",
+  "risk": "Medium",
+  "flags": [
+    "allof-merged"
+  ],
+  "warnings": []
+}

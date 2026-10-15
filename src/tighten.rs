@@ -11,7 +11,12 @@
 //!   closed, else the tool is skipped;
 //! - nullable `anyOf`/`oneOf` (`[T, null]`) and `type: ["T", "null"]`
 //!   collapse to `Option<T>` (the SDK-validated reading of the MCP nullable
-//!   idiom).
+//!   idiom);
+//! - bare nested `oneOf`/`anyOf`/`allOf` flatten into their parent union or
+//!   merge, and boolean schemas lower to `Any`;
+//! - validation keywords the SDK cannot express (`not`, `if`/`then`/`else`,
+//!   tuple `prefixItems`, ...) are dropped with a report warning, since the
+//!   MCP server remains authoritative.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -258,15 +263,31 @@ fn tighten_inner<'a>(
             ));
         }
     }
-    if object.contains_key("oneOf")
-        || object.contains_key("anyOf")
-        || object.contains_key("allOf")
-        || object.contains_key("not")
+    if object.contains_key("oneOf") || object.contains_key("anyOf") || object.contains_key("allOf")
     {
         return Err(Skip::new(
             "non-object-schema",
             format!("tool {:?}: inputSchema must be a plain object", tool.name),
         ));
+    }
+    // A top-level `not` constrains nothing the generator can preserve; the
+    // object itself still lowers, so this is a warning, not a skip.
+    if [
+        "not",
+        "if",
+        "then",
+        "else",
+        "dependentSchemas",
+        "contains",
+        "propertyNames",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key))
+    {
+        ctx.warnings.insert("schema-constraint-dropped".to_string());
+    }
+    if object.contains_key("prefixItems") {
+        ctx.warnings.insert("tuple-validation-dropped".to_string());
     }
     let properties = object
         .get("properties")
@@ -423,12 +444,46 @@ fn lookup_ref<'a>(target: &str, ctx: &Context<'a>) -> Result<&'a Value, Skip> {
     if let Some(hit) = ctx.defs.get(target) {
         return Ok(*hit);
     }
-    resolve_pointer(ctx.root, target).ok_or_else(|| {
-        Skip::new(
-            "unresolved-ref",
-            format!("reference {target:?} resolves to nothing"),
-        )
-    })
+    // URI fragments are percent-encoded (`%20` for space); decode before
+    // resolving, falling back to the raw target when it is not encoded.
+    let decoded = percent_decode(target);
+    if decoded != target {
+        if let Some(hit) = ctx.defs.get(&decoded) {
+            return Ok(*hit);
+        }
+    }
+    resolve_pointer(ctx.root, &decoded)
+        .or_else(|| resolve_pointer(ctx.root, target))
+        .ok_or_else(|| {
+            Skip::new(
+                "unresolved-ref",
+                format!("reference {target:?} resolves to nothing"),
+            )
+        })
+}
+
+/// Decodes `%XX` escapes in a `$ref` fragment. Malformed escapes are left
+/// untouched so the lookup simply misses instead of erroring.
+fn percent_decode(target: &str) -> String {
+    let bytes = target.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let rest = &bytes[index..];
+        if rest.len() >= 3
+            && rest[0] == b'%'
+            && rest[1].is_ascii_hexdigit()
+            && rest[2].is_ascii_hexdigit()
+        {
+            let hex = |b: u8| (b as char).to_digit(16).unwrap_or(0);
+            out.push((hex(rest[1]) * 16 + hex(rest[2])) as u8);
+            index += 3;
+        } else {
+            out.push(rest[0]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| target.to_string())
 }
 
 /// Follows a `$ref` chain to its object. Pure: cycle checks cover both the
@@ -534,12 +589,40 @@ fn convert_inner<'a, 's>(
 where
     'a: 's,
 {
+    // Boolean schemas are valid JSON Schema: `true` accepts anything, while
+    // `false` accepts nothing (loosened to `Any`; the server stays authoritative).
+    if let Some(allowed) = schema.as_bool() {
+        if !allowed {
+            ctx.warnings.insert("false-schema-loosened".to_string());
+        }
+        return Ok((FieldType::Any, false));
+    }
     let Some(object) = schema.as_object() else {
         return Err(Skip::new(
             "unsupported-schema",
             "a property schema must be an object".to_string(),
         ));
     };
+
+    // Validation keywords the generator cannot preserve client-side. The MCP
+    // server remains authoritative; the report records what was dropped.
+    if [
+        "not",
+        "if",
+        "then",
+        "else",
+        "dependentSchemas",
+        "contains",
+        "propertyNames",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key))
+    {
+        ctx.warnings.insert("schema-constraint-dropped".to_string());
+    }
+    if object.contains_key("prefixItems") {
+        ctx.warnings.insert("tuple-validation-dropped".to_string());
+    }
 
     if let Some(combined) = object.get("oneOf").or_else(|| object.get("anyOf")) {
         return convert_combined(combined, ctx, path);
@@ -618,6 +701,11 @@ where
         let (field_type, _) = convert_typed(real[0], object, ctx, path)?;
         return Ok((field_type, nullable));
     }
+    if real.is_empty() {
+        // `[]` (and `["null"]`) constrain nothing usable; loosen to `Any`.
+        ctx.warnings.insert("empty-type-loosened".to_string());
+        return Ok((FieldType::Any, nullable));
+    }
     Err(Skip::new(
         "unsupported-union",
         "a type union must hold one type plus null".to_string(),
@@ -647,6 +735,9 @@ where
                 return Ok((scalar_for(first), false));
             }
         }
+        // Mixed-kind or empty: no scalar covers the set, so the value set
+        // is dropped loudly, not silently.
+        ctx.warnings.insert("enum-not-constrained".to_string());
         return Ok((FieldType::Any, false));
     }
     if let Some(value) = object.get("const") {
@@ -703,27 +794,74 @@ where
             "oneOf/anyOf must not be empty".to_string(),
         ));
     }
-    // Nullable collapse: [T, null] becomes Option<T>.
+    // Nullable collapse ([T, null] becomes Option<T>), with bare nested
+    // `oneOf`/`anyOf` flattened in: `oneOf: [$ref Alias]` lowers the same
+    // whether `Alias` is a scalar or another union.
     let mut real: Vec<&Value> = Vec::new();
-    for branch in branches {
+    let mut nullable = false;
+    let mut seen_refs = HashSet::new();
+    let mut queue: std::collections::VecDeque<&Value> = branches.iter().collect();
+    while let Some(branch) = queue.pop_front() {
         let resolved = if branch.get("$ref").is_some() {
             let target = branch.get("$ref").and_then(Value::as_str).unwrap_or("#");
+            if !seen_refs.insert(target.to_string()) {
+                return Err(Skip::new(
+                    "recursive-schema",
+                    format!("reference {target:?} is recursive"),
+                ));
+            }
             resolve_chain(target, ctx)?
         } else {
             branch
         };
+        if let Some(items) = resolved.as_object().and_then(bare_combined_branches) {
+            // In place: nested branches expand where the wrapper stood, so
+            // variant order still follows the schema.
+            for item in items.iter().rev() {
+                queue.push_front(item);
+            }
+            continue;
+        }
         if resolved.get("type") == Some(&Value::from("null")) {
+            nullable = true;
             continue;
         }
         real.push(resolved);
     }
-    let nullable = real.len() != branches.len();
-    if real.len() == 1 && nullable {
-        let (field_type, _) = convert(real[0], ctx, path)?;
-        return Ok((field_type, true));
+    // Nullable spellings on the branches themselves (`{"type": ["object",
+    // "null"]}`) normalize to the plain type; the union carries the null.
+    let mut owned: Vec<Value> = Vec::new();
+    let mut owned_at: HashMap<usize, usize> = HashMap::new();
+    for (index, branch) in real.iter().enumerate() {
+        let single = branch
+            .as_object()
+            .and_then(|object| object.get("type"))
+            .and_then(Value::as_array)
+            .and_then(|kinds| {
+                let mut kinds: Vec<&str> = kinds.iter().filter_map(Value::as_str).collect();
+                let has_null = kinds.contains(&"null");
+                kinds.retain(|kind| *kind != "null");
+                (has_null && kinds.len() == 1).then(|| kinds[0])
+            });
+        if let (Some(only), Some(object)) = (single, real[index].as_object()) {
+            let mut normalized = object.clone();
+            normalized.insert("type".to_string(), Value::from(only));
+            owned_at.insert(index, owned.len());
+            owned.push(Value::Object(normalized));
+            nullable = true;
+        }
     }
-    if real.len() == 1 && branches.len() == 1 {
-        return convert(real[0], ctx, path);
+    let real: Vec<&Value> = real
+        .iter()
+        .enumerate()
+        .map(|(index, branch)| match owned_at.get(&index) {
+            Some(at) => &owned[*at],
+            None => *branch,
+        })
+        .collect();
+    if real.len() == 1 {
+        let (field_type, inner_nullable) = convert(real[0], ctx, path)?;
+        return Ok((field_type, nullable || inner_nullable));
     }
     if real.is_empty() {
         return Ok((FieldType::Any, true));
@@ -760,9 +898,39 @@ where
     }
     // Scalar-or-array union (string, list of strings, ...): an untagged enum
     // over scalar shapes. Anything else is genuinely unlowerable.
-    scalar_union(&real)
-        .map(|variants| finish_enum(variants, nullable, ctx, &path))
-        .map_err(|detail| Skip::new("unsupported-union", detail))
+    let variants = scalar_union(&real).map_err(|detail| Skip::new("unsupported-union", detail))?;
+    // Identical branches collapse to the one scalar (`oneOf: [string,
+    // string]` is just a string), instead of a one-variant enum or a skip.
+    if variants.len() == 1 {
+        if let VariantKind::Scalar(shape) = &variants[0].kind {
+            return Ok((shape.clone(), nullable));
+        }
+        return Err(Skip::new(
+            "unsupported-union",
+            "oneOf/anyOf branches must all be objects or scalars".to_string(),
+        ));
+    }
+    if variants.is_empty() {
+        return Err(Skip::new(
+            "unsupported-union",
+            "oneOf/anyOf branches must all be objects or scalars".to_string(),
+        ));
+    }
+    Ok(finish_enum(variants, nullable, ctx, &path))
+}
+
+/// Returns the nested branches when an object is a bare `oneOf`/`anyOf`
+/// wrapper (combinator plus documentation keys only). Objects carrying
+/// structural siblings are not flattened: inlining them would drop those
+/// constraints.
+fn bare_combined_branches(object: &serde_json::Map<String, Value>) -> Option<&Vec<Value>> {
+    let nested = object.get("oneOf").or_else(|| object.get("anyOf"))?;
+    let items = nested.as_array()?;
+    let inline = ["oneOf", "anyOf", "title", "description", "$comment"];
+    object
+        .keys()
+        .all(|key| inline.contains(&key.as_str()))
+        .then_some(items)
 }
 
 /// Dedupes variant names, assigns the enum type name, and wraps the result.
@@ -816,9 +984,6 @@ fn scalar_union(branches: &[&Value]) -> Result<Vec<EnumVariant>, String> {
             name: variant_name(&shape),
             kind: VariantKind::Scalar(shape),
         });
-    }
-    if variants.len() < 2 {
-        return Err("oneOf/anyOf branches must all be objects or scalars".to_string());
     }
     variants.sort_by_key(|variant| match &variant.kind {
         VariantKind::Scalar(shape) => has_float(shape),
@@ -932,6 +1097,25 @@ fn is_plain_object(object: &serde_json::Map<String, Value>) -> bool {
     }
 }
 
+/// Whether an `allOf` branch can merge: a plain object, tolerating a
+/// nullable `["object", "null"]` spelling (the merge still constrains to an
+/// object, so the null needs no flag) and a nested `allOf` the caller flattens.
+fn is_mergeable_object(object: &serde_json::Map<String, Value>) -> bool {
+    if object.contains_key("$ref") || object.contains_key("oneOf") || object.contains_key("anyOf") {
+        return false;
+    }
+    match object.get("type") {
+        None => true,
+        Some(Value::String(kind)) => kind == "object",
+        Some(Value::Array(kinds)) => {
+            let mut kinds: Vec<&str> = kinds.iter().filter_map(Value::as_str).collect();
+            kinds.sort_unstable();
+            kinds == ["null", "object"]
+        }
+        _ => false,
+    }
+}
+
 fn convert_all_of<'a, 's>(
     all: &'s Value,
     ctx: &mut Context<'a>,
@@ -955,9 +1139,19 @@ where
     let mut merged: serde_json::Map<String, Value> = serde_json::Map::new();
     let mut properties = serde_json::Map::new();
     let mut required: Vec<Value> = Vec::new();
-    for branch in branches {
+    // A worklist: nested `allOf` flattens in, so `allOf: [$ref Base]` lowers
+    // the same whether `Base` is an object or another `allOf`.
+    let mut seen_refs = HashSet::new();
+    let mut queue: std::collections::VecDeque<&Value> = branches.iter().collect();
+    while let Some(branch) = queue.pop_front() {
         let resolved = if branch.get("$ref").is_some() {
             let target = branch.get("$ref").and_then(Value::as_str).unwrap_or("#");
+            if !seen_refs.insert(target.to_string()) {
+                return Err(Skip::new(
+                    "recursive-schema",
+                    format!("reference {target:?} is recursive"),
+                ));
+            }
             resolve_chain(target, ctx)?
         } else {
             branch
@@ -968,7 +1162,20 @@ where
                 "allOf branches must all be objects".to_string(),
             ));
         };
-        if !is_plain_object(object) {
+        if let Some(nested) = object.get("allOf") {
+            let Some(nested) = nested.as_array() else {
+                return Err(Skip::new(
+                    "unsupported-allof",
+                    "allOf must be an array".to_string(),
+                ));
+            };
+            // In place: the merge still sees branches in schema order, so
+            // the first definition of a property keeps winning conflicts.
+            for branch in nested.iter().rev() {
+                queue.push_front(branch);
+            }
+        }
+        if !is_mergeable_object(object) {
             return Err(Skip::new(
                 "unsupported-allof",
                 "allOf branches must all be plain objects".to_string(),

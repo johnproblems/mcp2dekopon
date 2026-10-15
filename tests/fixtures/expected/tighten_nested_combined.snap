@@ -1,0 +1,43 @@
+{
+  "mcp_name": "probe",
+  "cap_name": "probe",
+  "description": "Tool probe",
+  "fields": [
+    {
+      "mcp_name": "value",
+      "rust_name": "value",
+      "type": {
+        "Enum": {
+          "type_name": "ProbeValueValue",
+          "variants": [
+            {
+              "name": "Single",
+              "kind": {
+                "Scalar": "String"
+              }
+            },
+            {
+              "name": "Integer",
+              "kind": {
+                "Scalar": "Integer"
+              }
+            },
+            {
+              "name": "Flag",
+              "kind": {
+                "Scalar": "Boolean"
+              }
+            }
+          ]
+        }
+      },
+      "required": true,
+      "description": ""
+    }
+  ],
+  "top_level_map": false,
+  "effect": "ExternalWrite",
+  "risk": "Medium",
+  "flags": [],
+  "warnings": []
+}

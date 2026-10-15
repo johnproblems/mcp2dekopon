@@ -14,6 +14,41 @@ pub fn validate_provider_id(raw: &str) -> Result<String, String> {
     Ok(raw.to_string())
 }
 
+/// Suggests the closest valid provider id for a rejected `--id`, if the raw
+/// value has any usable characters at all.
+pub fn suggest_provider_id(raw: &str) -> Option<String> {
+    let mut cleaned = String::with_capacity(raw.len());
+    let mut previous_was_separator = true;
+    for character in raw.chars().map(|c| c.to_ascii_lowercase()) {
+        if character.is_ascii_lowercase() || character.is_ascii_digit() {
+            cleaned.push(character);
+            previous_was_separator = false;
+        } else if matches!(character, '.' | '-' | '_') {
+            if !previous_was_separator {
+                cleaned.push(character);
+                previous_was_separator = true;
+            }
+        } else if !previous_was_separator {
+            cleaned.push('-');
+            previous_was_separator = true;
+        }
+    }
+    while cleaned.ends_with(['.', '-', '_']) {
+        cleaned.pop();
+    }
+    while cleaned.len() > MAX_IDENTIFIER_LEN {
+        cleaned.pop();
+    }
+    while cleaned.ends_with(['.', '-', '_']) {
+        cleaned.pop();
+    }
+    if cleaned.is_empty() || cleaned == raw {
+        return None;
+    }
+    validate_identifier(&cleaned, "provider id").ok()?;
+    Some(cleaned)
+}
+
 fn validate_identifier(value: &str, kind: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err(format!("{kind} must not be empty"));
@@ -64,9 +99,23 @@ pub fn sanitize_tool_name(
     used: &mut HashSet<String>,
     max_len: usize,
 ) -> Result<String, String> {
+    // Split camel humps first (`readWikiContents` to `read-wiki-contents`),
+    // mirroring `rust_field_name` so servers that mix cases stay readable.
+    let chars: Vec<char> = raw.chars().collect();
     let mut base = String::with_capacity(raw.len());
     let mut previous_was_separator = true;
-    for character in raw.chars().map(|c| c.to_ascii_lowercase()) {
+    for (index, &character) in chars.iter().enumerate() {
+        let previous = index.checked_sub(1).and_then(|i| chars.get(i));
+        let next = chars.get(index + 1);
+        let hump = character.is_ascii_uppercase()
+            && !previous_was_separator
+            && (previous.is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit())
+                || next.is_some_and(|n| n.is_ascii_lowercase()));
+        if hump {
+            base.push('-');
+            previous_was_separator = true;
+        }
+        let character = character.to_ascii_lowercase();
         if character.is_ascii_lowercase() || character.is_ascii_digit() {
             base.push(character);
             previous_was_separator = false;
@@ -151,20 +200,34 @@ pub fn rust_field_name(mcp: &str, used: &mut HashSet<String>) -> String {
     if base == "_" {
         base = "field".to_string();
     }
+    // Dedupe on both the candidate and its keyword-mapped form: `self`
+    // renders as `self_`, so a later literal `self_` must not reuse it.
     let mut candidate = base.clone();
     let mut counter = 2_u32;
-    while used.contains(&candidate) {
+    loop {
+        let mapped = mapped_field_name(&candidate);
+        if !used.contains(&candidate) && !used.contains(&mapped) {
+            used.insert(candidate.clone());
+            if mapped != candidate {
+                used.insert(mapped.clone());
+            }
+            return mapped;
+        }
         candidate = format!("{base}_{counter}");
         counter += 1;
     }
-    used.insert(candidate.clone());
-    if candidate == "self" || candidate == "Self" {
-        return format!("{candidate}_");
+}
+
+/// Maps a field name away from Rust keywords (`type` to `r#type`, `self` to
+/// `self_`); every other name passes through unchanged.
+fn mapped_field_name(candidate: &str) -> String {
+    if candidate == "self" {
+        return "self_".to_string();
     }
-    if is_rust_keyword(&candidate) {
+    if is_rust_keyword(candidate) {
         return format!("r#{candidate}");
     }
-    candidate
+    candidate.to_string()
 }
 
 /// Converts identifier segments to a `PascalCase` Rust type name, deduplicated
@@ -186,6 +249,10 @@ pub fn rust_type_name(segments: &[&str], used: &mut HashSet<String>) -> String {
         .collect();
     if base.is_empty() || base.starts_with(|c: char| c.is_ascii_digit()) {
         base = format!("T{base}");
+    }
+    // `Self` is reserved in type position; nothing generated may claim it.
+    if base == "Self" {
+        base = "SelfType".to_string();
     }
     let mut candidate = base.clone();
     let mut counter = 2_u32;
@@ -282,15 +349,19 @@ mod tests {
         );
         assert_eq!(
             sanitize_tool_name("readWikiContents", &mut used, 200).unwrap(),
-            "readwikicontents"
-        );
-        assert_eq!(
-            sanitize_tool_name("Read Wiki Contents!", &mut used, 200).unwrap(),
             "read-wiki-contents"
         );
         assert_eq!(
-            sanitize_tool_name("read-wiki-contents", &mut used, 200).unwrap(),
+            sanitize_tool_name("readWIKIContents", &mut used, 200).unwrap(),
             "read-wiki-contents-2"
+        );
+        assert_eq!(
+            sanitize_tool_name("Read Wiki Contents!", &mut used, 200).unwrap(),
+            "read-wiki-contents-3"
+        );
+        assert_eq!(
+            sanitize_tool_name("read-wiki-contents", &mut used, 200).unwrap(),
+            "read-wiki-contents-4"
         );
         assert!(sanitize_tool_name("!!!", &mut used, 200).is_err());
     }
@@ -307,6 +378,19 @@ mod tests {
     }
 
     #[test]
+    fn keyword_remaps_reserve_their_output() {
+        let mut used = HashSet::new();
+        assert_eq!(rust_field_name("self", &mut used), "self_");
+        assert!(used.contains("self"), "{used:?}");
+        assert!(used.contains("self_"), "{used:?}");
+        assert_eq!(rust_field_name("type", &mut used), "r#type");
+        assert!(used.contains("r#type"), "{used:?}");
+        // Repeats still dedupe on the pre-mapped name.
+        assert_eq!(rust_field_name("self", &mut used), "self_2");
+        assert_eq!(rust_field_name("type", &mut used), "type_2");
+    }
+
+    #[test]
     fn type_names_are_pascal_and_unique() {
         let mut used = HashSet::new();
         assert_eq!(
@@ -318,6 +402,24 @@ mod tests {
             "ReadWikiFilter2"
         );
         assert_eq!(rust_type_name(&["9", "x"], &mut used), "T9X");
+    }
+
+    #[test]
+    fn self_never_becomes_a_type_name() {
+        let mut used = HashSet::new();
+        assert_eq!(rust_type_name(&["self"], &mut used), "SelfType");
+        assert_eq!(rust_type_name(&["self"], &mut used), "SelfType2");
+    }
+
+    #[test]
+    fn provider_id_suggestions_stay_close() {
+        assert_eq!(suggest_provider_id("BadId"), Some("badid".to_string()));
+        assert_eq!(suggest_provider_id("My MCP!"), Some("my-mcp".to_string()));
+        assert_eq!(suggest_provider_id(&"A".repeat(300)), Some("a".repeat(253)));
+        // Valid ids and hopeless ones suggest nothing.
+        assert_eq!(suggest_provider_id("deepwiki"), None);
+        assert_eq!(suggest_provider_id("!!!"), None);
+        assert_eq!(suggest_provider_id(""), None);
     }
 
     #[test]

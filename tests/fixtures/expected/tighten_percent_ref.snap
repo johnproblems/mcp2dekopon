@@ -1,0 +1,19 @@
+{
+  "mcp_name": "probe",
+  "cap_name": "probe",
+  "description": "Tool probe",
+  "fields": [
+    {
+      "mcp_name": "value",
+      "rust_name": "value",
+      "type": "String",
+      "required": true,
+      "description": ""
+    }
+  ],
+  "top_level_map": false,
+  "effect": "ExternalWrite",
+  "risk": "Medium",
+  "flags": [],
+  "warnings": []
+}

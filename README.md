@@ -10,6 +10,38 @@ mcp2dekopon gen --url https://mcp.deepwiki.com/mcp --id deepwiki --out ./out
 cd ./out/deepwiki && ./build.sh && cargo test
 ```
 
+## Demos
+
+Real runs against the loopback mock (`scripts/mock-mcp.py`), recorded by
+`scripts/record-demos.py`: every command executes for real and the frames
+render the bytes the commands wrote. MP4 versions sit next to each GIF.
+
+![Generate a provider from a mock MCP server](docs/demos/generate.gif)
+*Generate ([mp4](docs/demos/generate.mp4)): fetch, tighten, and render a
+provider, then inspect the crate and `report.json`.*
+
+![Capture a tool list and replay it offline](docs/demos/offline.gif)
+*Offline ([mp4](docs/demos/offline.mp4)): `--save-tools` captures the list,
+then `--from-file` regenerates from a dead URL without fetching.*
+
+![Dry run and error suggestions](docs/demos/review.gif)
+*Review ([mp4](docs/demos/review.mp4)): `--dry-run` previews the run, and a
+rejected `--id` suggests the closest valid spelling.*
+
+### Regenerating the demos
+
+```sh
+python3 -m venv .venv && . .venv/bin/activate
+pip install pillow imageio-ffmpeg   # rendering only; recording is stdlib
+python3 scripts/record-demos.py     # rebuilds, records, verifies docs/demos/
+```
+
+The script builds the binary, serves the mock on `:18087`, runs each demo's
+commands under a pty with their true timing, renders GIF + MP4, and then
+verifies every file (decodes, 10–15 s duration, animated non-blank frames).
+`python3 scripts/record-demos.py --verify-only` re-checks the committed
+files without re-recording.
+
 ## Why this exists
 
 The Dekopon roadmap lists "MCP interoperability" as a next milestone and
@@ -97,13 +129,24 @@ Every run writes `<out>/report.json`. Review it before installing:
 4. Each capability's `effect`/`risk` — the generator defaults to
    `external-write`/`Medium`; confirm every `read-only` before granting the
    provider's `read-only` Cedar group.
+5. `options` — the offered protocol version, timeout, retry, and tool-cap
+   settings, so a replay with the same flags renders the same report
+   (up to `generated_at` and `elapsed_ms`).
 
 ```json
 {
+  "format_version": 1,
   "generator": "mcp2dekopon",
-  "generator_version": "0.1.0",
+  "generator_version": "0.2.0",
   "sdk_version": "0.46.1",
   "generated_at": "2026-10-13T00:00:00Z",
+  "elapsed_ms": 412,
+  "options": {
+    "offered_protocol_version": "2025-06-18",
+    "timeout_secs": 30,
+    "max_attempts": 3,
+    "max_tools": 1000
+  },
   "summary": { "listed": 6, "generated": 5, "skipped": 1, "providers": 1 },
   "server": {
     "url": "http://127.0.0.1:PORT/mcp",
@@ -155,16 +198,18 @@ mcp2dekopon gen --url <URL> --id <ID> --out <DIR> [options]
 | Flag | Meaning |
 | --- | --- |
 | `--url` | MCP Streamable HTTP endpoint. Must be `http(s)`, no userinfo, query or fragment. Baked in as the vendor default; overridable via `providerSettings.<id>.baseUrl`. |
-| `--id` | Provider id (and command word): lowercase letters/digits, `.` `-` `_`, never adjacent. |
+| `--id` | Provider id (and command word): lowercase letters/digits, `.` `-` `_`, never adjacent. A rejected id suggests the closest valid spelling. |
 | `--out` | Output directory; provider crates land in subdirectories. |
-| `--header NAME:VALUE` | Extra fetch header, repeatable (e.g. `Authorization: Bearer …`). Used only to fetch the tool list; never written to generated files. |
-| `--timeout-secs` | Per-request fetch timeout (default 30). |
-| `--protocol-version` | MCP protocol version to offer (default `2025-06-18`). |
-| `--dry-run` | Fetch and tighten, print the summary, write nothing. |
+| `--header NAME:VALUE` | Extra fetch header, repeatable (e.g. `Authorization: Bearer …`). Used only to fetch the tool list; never written to generated files. Names must be HTTP tokens; protocol headers (`content-type`, `mcp-session-id`, …) are reserved. |
+| `--timeout-secs` | Per-request fetch timeout (default 30), mirrored into each broker grant as `timeoutMs`. |
+| `--retries` | Fetch attempts per request before giving up (default 3). |
+| `--max-tools` | Most tools accepted from `tools/list` before refusing (default 1000). |
+| `--protocol-version` | MCP protocol version to offer (default `2025-06-18`); must not be empty. |
+| `--dry-run` | Fetch and tighten, print the summary, write nothing. Conflicts with `--save-tools`. |
 | `--save-tools <path>` | Fetch the tool list, save it as JSON, stop before generating. |
 | `--from-file <path>` | Generate from a saved tool list instead of fetching. |
 | `--quiet` / `--verbose` | Print only warnings and errors / log every fetch attempt. |
-| `--force` | Overwrite existing provider directories. |
+| `--force` | Overwrite existing provider directories, replacing them entirely. |
 
 `mcp2dekopon completions <shell>` prints shell completions for bash, zsh, fish,
 powershell, or elvish.
@@ -187,7 +232,8 @@ mcp2dekopon gen --url https://mcp.example.test/mcp --id example --out ./out --sa
 mcp2dekopon gen --url https://mcp.example.test/mcp --id example --out ./out --from-file tools.json
 ```
 
-The replayed report is identical to the live one except for `generated_at`
+The replayed report is identical to the live one except for `generated_at`,
+`elapsed_ms`, and the output directories
 (covered by `replayed_report_matches_the_live_report`).
 
 ## How it works
@@ -198,33 +244,41 @@ it, then render Rust and YAML.
 1. **Fetch.** POST `initialize`, then `tools/list` following `nextCursor`,
    over MCP Streamable HTTP. Reads `name`, `description`, `inputSchema` and
    `annotations`. Answers may be plain JSON or buffered SSE; the session id
-   and negotiated protocol version are echoed per the spec.
+   and negotiated protocol version are echoed per the spec. Timeouts,
+   refused connections, 5xx, and 429 (honoring `Retry-After` up to 30 s)
+   retry with backoff; an expired session re-initializes once per page; a
+   repeated cursor fails fast as a server loop. Bodies over 16 MiB are
+   refused, as are captures over 16 MiB under `--from-file`.
 2. **Tighten.** The SDK refuses any `$ref` and any object without
    `additionalProperties: false`. Rules, applied in order:
 
    | Input | Output |
    | --- | --- |
-   | Local `$ref` / `$defs` | Inlined (JSON-pointer targets included) |
+   | Local `$ref` / `$defs` | Inlined (percent-decoded, JSON-pointer targets included) |
    | Recursive `$ref` | Tool skipped (`recursive-schema`) |
    | External or unresolvable `$ref` | Tool skipped (`external-ref`, `unresolved-ref`) |
    | Every object | Closed struct with `deny_unknown_fields` |
    | Free map (only `additionalProperties`) | JSON string argument, parsed at call time (`free-map-as-string`) |
    | `oneOf` / `anyOf` of objects | Untagged Rust enum, when every branch closes |
    | `oneOf` / `anyOf` of scalars / arrays of scalars | Untagged enum (`Single`, `TextList`, …) |
+   | Identical scalar branches | Collapsed to the one scalar |
+   | Nested bare `oneOf` / `anyOf` / `allOf` | Flattened into the parent in place |
    | Anything else unioned | Tool skipped (`unsupported-union`) |
    | Nullable (`[T, null]`, `type: ["T", "null"]`) | `Option<T>` |
    | `allOf` of plain objects | Merged struct (`allof-merged`) or skipped (`unsupported-allof`) |
+   | Boolean schemas, empty `type: []` | `Any`, with a warning |
    | Non-object `inputSchema` | Tool skipped (`non-object-schema`) |
-   | Names | kebab-case flags, `snake_case` fields, `#[serde(rename)]` back to MCP |
+   | Names | kebab-case flags (camel humps split), `snake_case` fields, `#[serde(rename)]` back to MCP |
 
    Names that collide after sanitizing get numeric suffixes; servers over 32
    tools split into `<id>-1`, `<id>-2`, … in server order.
 3. **Render.** One `Capability` per tool with `Needs = (Settings, Http)`;
-   `run` replays `initialize` then `tools/call` as buffered JSON-RPC POSTs
-   (a capability cannot hold session state, so every call pays one extra
-   request) and prints the MCP `content` as one JSON line. A `tools/call`
-   answer with `isError` prints its content and then fails, so the model
-   sees both the output and the error.
+   `run` replays `initialize`, the `notifications/initialized` notice (best
+   effort), then `tools/call` as buffered JSON-RPC POSTs (a capability
+   cannot hold session state, so every call pays two extra requests) and
+   prints the MCP `content` as one JSON line. The call leg verifies the
+   JSON-RPC response id. A `tools/call` answer with `isError` prints its
+   content and then fails, so the model sees both the output and the error.
 
 ### Effect labels
 
@@ -243,11 +297,16 @@ the capability in the provider's `read-only` Cedar group.
 Validation the generator does not preserve client-side, because the MCP
 server remains authoritative and a stale copy would be worse than none:
 
-- numeric/string bounds (`minimum`, `maxLength`, `pattern`, …),
-- `enum` / `const` value sets (recorded as `enum-not-constrained` warnings),
-- `not`, `if`/`then`/`else`, `dependentSchemas`, tuple (`prefixItems`)
-  validation, and the dropped half of `properties` plus `additionalProperties`
-  (recorded as `additional-properties-dropped`).
+- numeric/string bounds (`minimum`, `maxLength`, `pattern`, …), silently;
+- `enum` / `const` value sets (recorded as `enum-not-constrained` warnings,
+  including mixed-kind and empty sets);
+- `not`, `if`/`then`/`else`, `dependentSchemas`, `contains`, and
+  `propertyNames` (recorded as `schema-constraint-dropped`), tuple
+  (`prefixItems`) validation (recorded as `tuple-validation-dropped`), and
+  the dropped half of `properties` plus `additionalProperties` (recorded as
+  `additional-properties-dropped`);
+- `false` schemas and empty `type: []` (loosened to `Any`, recorded as
+  `false-schema-loosened` and `empty-type-loosened`).
 
 The `initialize` leg is tolerant (a session id or protocol version that is
 missing or unparsable falls back to the offered version) while the `tools/call`
@@ -257,11 +316,13 @@ answer to both legs and still assert each request.
 ### Broker fragment
 
 Each capability gets an `http` grant pinned to the server's one origin:
-`allowedMethods: [POST]`, `maxRequests: 2`, byte limits, and a commented
-`credential:` slot. Auth uses the broker's credential store or public-DRN
-path; the generated provider never sees a token. Plaintext loopback origins
-get `allowPlaintextLoopback: true`; plaintext beyond loopback needs an
-`http.plaintextHosts` entry the fragment points at.
+`allowedMethods: [POST]`, `maxRequests: 3` (initialize, the initialized
+notice, plus the call), byte limits, a `timeoutMs` mirroring
+`--timeout-secs`, and a commented `credential:` slot. Auth uses the broker's
+credential store or public-DRN path; the generated provider never sees a
+token. Plaintext loopback origins get `allowPlaintextLoopback: true`;
+plaintext beyond loopback needs an `http.plaintextHosts` entry the fragment
+points at (and a warning is printed and added to the generated README).
 
 ## Development
 

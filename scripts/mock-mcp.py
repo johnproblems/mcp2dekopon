@@ -252,6 +252,8 @@ def main():
                 extra = int(args.pop(0))
             except ValueError:
                 fail("expected a number after --extra")
+            if extra < 0:
+                fail("--extra must be zero or more")
         elif arg == "--require-auth":
             if not args:
                 fail("expected a token after --require-auth")
@@ -265,6 +267,8 @@ def main():
                 port = int(arg)
             except ValueError:
                 fail(f"expected a port number, got {arg!r}")
+            if not 0 <= port <= 65535:
+                fail(f"port {port} is out of range 0-65535")
             port_set = True
     EXTRA_TOOLS = [make_extra(i) for i in range(extra)]
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
