@@ -31,14 +31,15 @@ caps = sum(len(p['capabilities']) for p in report['providers'])
 print('capabilities:', caps, 'skipped:', [(s['tool'], s['reason']) for s in report['skipped']])
 "
   for dir in $dirs; do
+    # report.json carries the out-joined provider path; use it as-is.
     echo "-- hygiene: $dir --"
-    cargo fmt --manifest-path "$work/$name/$dir/Cargo.toml" --check
-    cargo clippy --manifest-path "$work/$name/$dir/Cargo.toml" --all-targets -- -D warnings
+    cargo fmt --manifest-path "$dir/Cargo.toml" --check
+    cargo clippy --manifest-path "$dir/Cargo.toml" --all-targets -- -D warnings
     echo "-- native tests: $dir --"
-    cargo test --manifest-path "$work/$name/$dir/Cargo.toml" 2>&1 | grep -E "test result|error" | head -5
+    cargo test --manifest-path "$dir/Cargo.toml" 2>&1 | grep -E "test result|error" | head -5
     echo "-- wasm build + conformance: $dir --"
-    (cd "$work/$name/$dir" && ./build.sh)
-    cargo test --manifest-path "$work/$name/$dir/Cargo.toml" --test conformance 2>&1 | grep -E "test result"
+    (cd "$dir" && ./build.sh)
+    cargo test --manifest-path "$dir/Cargo.toml" --test conformance 2>&1 | grep -E "test result"
   done
 }
 
